@@ -1,0 +1,21 @@
+name: data-access-ai4ocean2026
+channels:
+  - conda-forge
+dependencies:
+  - copernicusmarine
+  - earthaccess
+  - netcdf4
+  - xarray
+  - cartopy
+  - pandas
+  - geopandas
+  - shapely
+  - paramiko
+  - zarr
+  - dask
+  - pyproj
+  - scipy
+  - matplotlib
+  - numpy
+  - requests
+  - ipykernel
