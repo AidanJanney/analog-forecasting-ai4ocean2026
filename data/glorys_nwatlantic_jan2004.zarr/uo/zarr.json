@@ -1,0 +1,63 @@
+{
+  "shape": [
+    31,
+    50,
+    181,
+    241
+  ],
+  "data_type": "int16",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        1,
+        50,
+        181,
+        241
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": 0,
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {
+    "cell_methods": "area: mean",
+    "long_name": "Eastward velocity",
+    "standard_name": "eastward_sea_water_velocity",
+    "unit_long": "Meters per second",
+    "units": "m s-1",
+    "valid_max": 4314,
+    "valid_min": -3123,
+    "add_offset": 0.0,
+    "scale_factor": 0.0006103701889514923,
+    "_FillValue": -32767
+  },
+  "dimension_names": [
+    "time",
+    "depth",
+    "latitude",
+    "longitude"
+  ],
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}
