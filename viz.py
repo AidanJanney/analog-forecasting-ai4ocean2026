@@ -210,6 +210,116 @@ def plot_swot_panels(swaths, labels, bbox=None, vmax=None,
     return _save(fig, fname, outdir)
 
 
+def plot_swot_analogs(obs_grid, mask, af, sel, dist, day, k=None,
+                      fname="swot_analogs.png", outdir=PLOTS):
+    """Binned SWOT observation beside its top GLORYS analog anomaly fields.
+
+    `af` is a swot_analog.SwotAnalogForecaster; `sel`/`dist` are analog indices
+    and distances (1 - correlation). The swath footprint is outlined on each
+    analog so the eye can check the match where SWOT observed.
+    """
+    k = len(sel) if k is None else min(k, len(sel))
+    obs = np.where(mask, obs_grid, np.nan)
+    fields = [af.anom[i] for i in sel[:k]]
+    pool = np.concatenate([obs[np.isfinite(obs)]]
+                          + [f[np.isfinite(f)] for f in fields])
+    vmax = float(np.nanpercentile(np.abs(pool), 98))
+    kw = dict(origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+
+    ncol = k + 1
+    aspect_wh = obs.shape[1] / obs.shape[0]
+    ph = 2.0
+    fig, ax = plt.subplots(1, ncol, figsize=(ncol * ph * aspect_wh + 1.0, ph + 1.2),
+                           constrained_layout=True, squeeze=False)
+    ax = ax[0]
+    ax[0].imshow(obs, **kw)
+    ax[0].set_title("SWOT obs\n(binned SSHA)", fontsize=8, weight="bold")
+    for s in ax[0].spines.values():
+        s.set(color="#7a3b9e", linewidth=2)
+    im = None
+    for c, (i, d) in enumerate(zip(sel[:k], dist[:k]), start=1):
+        im = ax[c].imshow(fields[c - 1], **kw)
+        ax[c].contour(mask, levels=[0.5], colors="k", linewidths=0.5)
+        ax[c].set_title(f"analog {c}\n{day[i]}  r={1 - d:.2f}", fontsize=8)
+    for a in ax:
+        a.set_xticks([])
+        a.set_yticks([])
+    if im is not None:
+        fig.colorbar(im, ax=ax, location="bottom", shrink=0.5, aspect=50,
+                     pad=0.02, label="SSHA anomaly (m)")
+    fig.suptitle("SWOT-selected GLORYS analogs   (top-K by masked SSHA correlation)",
+                 fontsize=12, weight="bold")
+    return _save(fig, fname, outdir, dpi=180)
+
+
+def plot_swot_forecast(af, obs_date, results, fname="swot_forecast.png", outdir=PLOTS):
+    """Per-lead: SWOT-driven dense forecast (anomaly) beside the future SWOT truth.
+
+    `results` is a list of dicts with keys L, fc_anom, obs2, mask2, r_analog.
+    """
+    leads = [r["L"] for r in results]
+    fields = [r["fc_anom"] for r in results] + \
+             [np.where(r["mask2"], r["obs2"], np.nan) for r in results]
+    pool = np.concatenate([f[np.isfinite(f)] for f in fields])
+    vmax = float(np.nanpercentile(np.abs(pool), 98))
+    kw = dict(origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+
+    nrow = len(results)
+    aspect_wh = af.anom.shape[2] / af.anom.shape[1]
+    ph = 2.0
+    fig, ax = plt.subplots(nrow, 2, figsize=(2 * ph * aspect_wh + 1.2, nrow * ph + 1.4),
+                           constrained_layout=True, squeeze=False)
+    im = None
+    for r, res in enumerate(results):
+        im = ax[r, 0].imshow(res["fc_anom"], **kw)
+        ax[r, 0].contour(res["mask2"], levels=[0.5], colors="k", linewidths=0.5)
+        ax[r, 0].set_title(f"FORECAST +{res['L']}d   r={res['r_analog']:.2f}",
+                           fontsize=9, weight="bold")
+        for s in ax[r, 0].spines.values():
+            s.set(color="#1a7d3c", linewidth=2)
+        ax[r, 1].imshow(np.where(res["mask2"], res["obs2"], np.nan), **kw)
+        ax[r, 1].set_title(f"SWOT truth +{res['L']}d", fontsize=9, weight="bold")
+        for s in ax[r, 1].spines.values():
+            s.set(color="#7a3b9e", linewidth=2)
+    for a in ax.ravel():
+        a.set_xticks([])
+        a.set_yticks([])
+    if im is not None:
+        fig.colorbar(im, ax=ax, location="bottom", shrink=0.5, aspect=50,
+                     pad=0.02, label="SSHA anomaly (m)")
+    fig.suptitle(f"SWOT-driven model-analog forecast   obs {obs_date}",
+                 fontsize=12, weight="bold")
+    return _save(fig, fname, outdir, dpi=180)
+
+
+def plot_swot_skill(leads, acc, rmse, counts, n_obs, fname="swot_skill.png",
+                    outdir=PLOTS):
+    """Observation-space skill vs lead: anomaly correlation (top) and RMSE (bottom).
+
+    `acc`/`rmse` are dicts {baseline: per-lead array}; `counts` is the number of
+    obs days contributing per lead; `n_obs` the total obs days aggregated over.
+    """
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+    for name in acc:
+        a1.plot(leads, acc[name], marker="o", label=name)
+        a2.plot(leads, rmse[name], marker="o", label=name)
+    a1.axhline(0, color="gray", lw=0.8)
+    a1.set_ylabel("anomaly correlation")
+    a2.set_ylabel("RMSE (m)")
+    a2.set_xlabel("lead time (days)")
+    for ax in (a1, a2):
+        ax.grid(True, alpha=0.3)
+    a1.legend()
+    # sample count per lead along the top
+    top = np.nanmax([np.nanmax(v) for v in acc.values()])
+    for L, c in zip(leads, counts):
+        a1.annotate(str(c), (L, top), fontsize=7, ha="center", va="bottom",
+                    color="gray")
+    a1.set_title(f"SWOT-driven forecast skill   (aggregated over {n_obs} obs days; "
+                 f"n per lead shown above)")
+    return _save(fig, fname, outdir)
+
+
 def plot_analog_ensemble(af, t0, leads, day, k=8, exclude=30, units="",
                          plot_depth=0, fname="analog_ensemble.png", outdir=PLOTS):
     """Visualise one analog forecast at one or more lead times.

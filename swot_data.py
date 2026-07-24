@@ -152,6 +152,25 @@ def load_swaths(paths, bbox=GOM_BBOX, var=SSHA_VAR, prefer="_PGC0_"):
     return swaths, labels
 
 
+def swaths_for_dates(dates, directory="data/swot", bbox=GOM_BBOX, var=SSHA_VAR,
+                     prefer="_PGC0_"):
+    """Load swaths whose acquisition start date is in `dates` (list of 'YYYY-MM-DD').
+
+    Filters the granules in `directory` by the date in their filename, then groups
+    them by pass via :func:`load_swaths`. Returns (swaths, labels).
+    """
+    import glob
+    import re
+
+    want = {d.replace("-", "") for d in dates}          # 'YYYYMMDD'
+    paths = []
+    for p in glob.glob(os.path.join(directory, "*.nc")):
+        m = re.search(r"_(\d{8})T\d{6}_", p)
+        if m and m.group(1) in want:
+            paths.append(p)
+    return load_swaths(paths, bbox=bbox, var=var, prefer=prefer)
+
+
 def _parse_args():
     p = argparse.ArgumentParser(description="Retrieve SWOT LR SSH from PO.DAAC.")
     sub = p.add_subparsers(dest="command", required=True)

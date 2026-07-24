@@ -1,13 +1,9 @@
-# %% Model-analog forecasting — main workflow.
-# Orchestrates the workflow modules end to end. Run cell-by-cell in an
-# interactive window (cells are separated by "# %%") or top-to-bottom as a
-# script. Modules:
-#   fronts / metrics  — front extraction and the pluggable analog / error metrics
-#   analog            — dissimilarity matrix (cached), forecaster, skill curve
-#   viz               — figures (written to plots/)
-#   download_glorys   — fetch the GLORYS library
-#   swot_data         — retrieve SWOT surface observations (optional cell below)
-import glob
+# %% GLORYS-internal model-analog forecasting.
+# Analogs are selected *within* the GLORYS library (front-MHD on zos) and
+# advanced to forecast the library state. Also tracks front dissimilarity.
+# Companion script: main_swot.py (analogs selected from real SWOT observations).
+# Modules: fronts / metrics (extraction + pluggable metrics), analog (cached
+# dissimilarity matrix, forecaster, skill curve), viz (figures → plots/).
 import os
 
 import xarray as xr
@@ -15,7 +11,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import viz
-import swot_data
 from fronts import LEVEL
 from metrics import (  # noqa: F401
     FrontMHD, SurfaceFieldRMSE, WeightedRMSE, AnomalyCorrelation,
@@ -29,7 +24,7 @@ DATA_CANDIDATES = [
     "data/glorys_gom_zos_2004_2013.nc",    # 10-year zos library
     "data/glorys_gom_zos_2004.nc",         # single-year fallback
 ]
-ANALOG_METRIC = FrontMHD()                 # analogs from surface SSH fronts (→ SWOT)
+ANALOG_METRIC = FrontMHD()                 # analogs from surface SSH fronts
 FORECAST_VAR = "zos"                       # variable to forecast (e.g. "thetao")
 DEPTHS = None                              # None (surface) or slice(0, 10) for a 3-D var
 PLOT_DEPTH = 0                             # depth index shown in the map panels
@@ -97,20 +92,6 @@ viz.plot_analog_ensemble(af, t0, [lead, 14], day, k=K, exclude=EXCLUDE,
 skill = skill_curve(af, LEADS, k=K, exclude=EXCLUDE)
 viz.plot_skill(LEADS, skill, FORECAST_VAR, ANALOG_METRIC.name,
                ERROR_METRIC.name, day[0][:4])
-
-# %% SWOT surface observations over the same box.
-# Downloads need a one-time Earthdata login (see swot_data docstring):
-#   ! python -c "import earthaccess; earthaccess.login(strategy='interactive', persist=True)"
-# swot_data.fetch_swot("2024-01-01", "2024-01-02")          # -> data/swot/*.nc
-swot_paths = sorted(glob.glob("data/swot/*.nc"))
-if swot_paths:
-    swaths, labels = swot_data.load_swaths(swot_paths)      # grouped by pass, calibrated
-    print(f"SWOT: {len(swaths)} passes over the box from {len(swot_paths)} granules")
-    viz.plot_swot_swaths(swaths, bbox=swot_data.GOM_BBOX,
-                         title="SWOT KaRIn SSHA (crossover-calibrated)")
-    viz.plot_swot_panels(swaths, labels, bbox=swot_data.GOM_BBOX)
-else:
-    print("No SWOT granules yet — run swot_data.fetch_swot(start, end) first.")
 
 plt.show()
 
