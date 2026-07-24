@@ -214,9 +214,9 @@ def plot_swot_analogs(obs_grid, mask, af, sel, dist, day, k=None,
                       fname="swot_analogs.png", outdir=PLOTS):
     """Binned SWOT observation beside its top GLORYS analog anomaly fields.
 
-    `af` is a swot_analog.SwotAnalogForecaster; `sel`/`dist` are analog indices
-    and distances (1 - correlation). The swath footprint is outlined on each
-    analog so the eye can check the match where SWOT observed.
+    `af` is an analog.AnalogForecaster; `sel`/`dist` are analog indices and
+    distances (1 - correlation). The swath footprint is outlined on each analog so
+    the eye can check the match where SWOT observed.
     """
     k = len(sel) if k is None else min(k, len(sel))
     obs = np.where(mask, obs_grid, np.nan)
@@ -286,8 +286,8 @@ def plot_swot_forecast(af, obs_date, results, fname="swot_forecast.png", outdir=
         a.set_yticks([])
     if im is not None:
         fig.colorbar(im, ax=ax, location="bottom", shrink=0.5, aspect=50,
-                     pad=0.02, label="SSHA anomaly (m)")
-    fig.suptitle(f"SWOT-driven model-analog forecast   obs {obs_date}",
+                     pad=0.02, label="mesoscale SSHA anomaly (m)")
+    fig.suptitle(f"SWOT-driven model-analog forecast (deseasonalized)   obs {obs_date}",
                  fontsize=12, weight="bold")
     return _save(fig, fname, outdir, dpi=180)
 
@@ -304,8 +304,8 @@ def plot_swot_skill(leads, acc, rmse, counts, n_obs, fname="swot_skill.png",
         a1.plot(leads, acc[name], marker="o", label=name)
         a2.plot(leads, rmse[name], marker="o", label=name)
     a1.axhline(0, color="gray", lw=0.8)
-    a1.set_ylabel("anomaly correlation")
-    a2.set_ylabel("RMSE (m)")
+    a1.set_ylabel("mesoscale anomaly correlation")
+    a2.set_ylabel("mesoscale RMSE (m)")
     a2.set_xlabel("lead time (days)")
     for ax in (a1, a2):
         ax.grid(True, alpha=0.3)
@@ -315,8 +315,248 @@ def plot_swot_skill(leads, acc, rmse, counts, n_obs, fname="swot_skill.png",
     for L, c in zip(leads, counts):
         a1.annotate(str(c), (L, top), fontsize=7, ha="center", va="bottom",
                     color="gray")
-    a1.set_title(f"SWOT-driven forecast skill   (aggregated over {n_obs} obs days; "
-                 f"n per lead shown above)")
+    a1.set_title(f"SWOT-driven forecast skill (deseasonalized / mesoscale)   "
+                 f"(aggregated over {n_obs} obs days; n per lead shown above)")
+    return _save(fig, fname, outdir)
+
+
+def _front_px(front, lon, lat):
+    """Map (lon,lat) front vertices to imshow pixel coords for a regular grid."""
+    if front is None or len(front) == 0:
+        return np.empty(0), np.empty(0)
+    px = (front[:, 0] - lon[0]) / (lon[1] - lon[0])
+    py = (front[:, 1] - lat[0]) / (lat[1] - lat[0])
+    return px, py
+
+
+def plot_analog_glorys_maps(saf, obs_day, obs_grid, mask, sel, day, fc_anoms,
+                            truth_anom, accs, lead, dist=None, k_show=6,
+                            fc_fronts=None, truth_front=None, lc_mhd=None,
+                            init_anom=None, init_front=None,
+                            fname="analog_glorys_maps.png", outdir=PLOTS):
+    """SWOT obs | analog | GLORYS init | +lead forecast | dense GLORYS truth.
+
+    Each row is one SWOT-selected (de-clustered) analog. The first column is the SWOT
+    swath that drove the selection (gridded, NaN off-swath, offset removed since ssha
+    and zos have different references) and the third is the dense GLORYS truth at the
+    *obs* day — the initial condition the forecast has to move away from — so each row
+    reads left-to-right as what was observed, what matched it, where the ocean actually
+    started, where the analog says it goes, and where it actually went. Titles carry the
+    analog date, the forecast's dense ACC and its Loop Current front error (MHD, km).
+    The Loop Current front is overlaid on the initial condition (orange), the forecast
+    (green) and the truth (black), with the truth front also drawn on each forecast
+    panel so the position error is visible. All model maps are deseasonalized (the
+    initial condition at the obs day, the rest at the verification day) and share a
+    diverging scale.
+    """
+    k = min(k_show, len(sel))
+    sel_fields = [saf.deseasonalize(saf.anom[i], saf.times[i]) for i in sel[:k]]
+    fcs = fc_anoms[:k]
+    pool = np.concatenate([truth_anom[np.isfinite(truth_anom)]]
+                          + ([] if init_anom is None else [init_anom[np.isfinite(init_anom)]])
+                          + [f[np.isfinite(f)] for f in sel_fields + list(fcs)])
+    vmax = float(np.nanpercentile(np.abs(pool), 98))
+    kw = dict(origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
+    tf_px = _front_px(truth_front, saf.lon, saf.lat)
+    if_px = _front_px(init_front, saf.lon, saf.lat)
+    # SWOT ssha is referenced to a mean sea surface, zos to the library mean: the
+    # selection kernel is offset-invariant, so show the swath with its offset removed.
+    obs_show = np.where(mask, obs_grid - np.nanmean(obs_grid[mask]), np.nan)
+
+    cols = ["swot", "analog", "init", "forecast", "truth"]
+    if init_anom is None:
+        cols.remove("init")
+    c = {name: j for j, name in enumerate(cols)}
+    nc = len(cols)
+
+    aspect_wh = truth_anom.shape[1] / truth_anom.shape[0]
+    ph = 1.9
+    fig, ax = plt.subplots(k, nc, figsize=(nc * ph * aspect_wh + 1.2, k * ph + 1.2),
+                           constrained_layout=True, squeeze=False)
+    im = None
+    for r in range(k):
+        i = sel[r]
+        a_obs = ax[r, c["swot"]]
+        a_obs.set_facecolor("#e8e8e8")                   # unobserved (off-swath) cells
+        a_obs.imshow(obs_show, **kw)
+        a_obs.set_title(f"SWOT obs {obs_day}", fontsize=8)
+        for s in a_obs.spines.values():
+            s.set(color="#2a6ebb", linewidth=2)
+        ax[r, c["analog"]].imshow(sel_fields[r], **kw)
+        ax[r, c["analog"]].contour(mask, levels=[0.5], colors="k", linewidths=0.4)
+        rr = "" if dist is None else f"  r={1 - dist[r]:.2f}"
+        ax[r, c["analog"]].set_title(f"analog {r + 1}: {day[i]}{rr}", fontsize=8)
+        if init_anom is not None:
+            a_ic = ax[r, c["init"]]
+            a_ic.imshow(init_anom, **kw)
+            a_ic.plot(*if_px, ".", ms=1.1, color="#b5651d")       # initial LC front
+            a_ic.set_title(f"GLORYS init {obs_day}", fontsize=8)
+            for s in a_ic.spines.values():
+                s.set(color="#d9a05b", linewidth=2)
+        a_fc = ax[r, c["forecast"]]
+        im = a_fc.imshow(fcs[r], **kw)
+        if fc_fronts is not None:                       # forecast LC front (green)
+            fx, fy = _front_px(fc_fronts[r], saf.lon, saf.lat)
+            a_fc.plot(fx, fy, ".", ms=1.1, color="#127a2e")
+        a_fc.plot(*tf_px, ".", ms=0.8, color="k", alpha=0.7)      # truth front
+        lc = "" if lc_mhd is None else f"   LC={lc_mhd[r]:.0f}km"
+        a_fc.set_title(f"forecast +{lead}d   ACC={accs[r]:+.2f}{lc}",
+                       fontsize=8, weight="bold")
+        for s in a_fc.spines.values():
+            s.set(color="#1a7d3c", linewidth=2)
+        ax[r, c["truth"]].imshow(truth_anom, **kw)
+        ax[r, c["truth"]].plot(*tf_px, ".", ms=1.1, color="k")    # Loop Current
+        ax[r, c["truth"]].set_title(f"GLORYS truth +{lead}d", fontsize=8)
+        for s in ax[r, c["truth"]].spines.values():
+            s.set(color="#b5651d", linewidth=2)
+    for a in ax.ravel():
+        a.set_xticks([])
+        a.set_yticks([])
+        a.set_xlim(0, truth_anom.shape[1] - 1)
+        a.set_ylim(0, truth_anom.shape[0] - 1)
+    if im is not None:
+        fig.colorbar(im, ax=ax, location="bottom", shrink=0.4, aspect=60,
+                     pad=0.02, label="deseasonalized SSHA anomaly (m)")
+    fig.suptitle(f"SWOT-selected analogs → {lead}-day forecast vs GLORYS   obs {obs_day}"
+                 f"   (Loop Current: orange = initial, green = forecast, black = truth)",
+                 fontsize=12, weight="bold")
+    return _save(fig, fname, outdir, dpi=180)
+
+
+def plot_analog_glorys_lc_skill(obs_days, results, lead,
+                                fname="analog_glorys_lc_skill.png", outdir=PLOTS):
+    """Per-obs-day Loop Current forecast skill: front MHD (km), lower = better.
+
+    For each obs day: the K de-clustered analogs' Loop Current front error at `lead`
+    days (dots), the ensemble mean (diamond) and dense persistence (x). The Loop
+    Current front is the offset-referenced 0.17-m ``zos`` contour; MHD is the modified
+    Hausdorff distance to the truth front.
+    """
+    x = np.arange(len(obs_days))
+    fig, ax = plt.subplots(figsize=(max(7, 1.1 * len(x) + 2), 5))
+    for xi, r in zip(x, results):
+        first = xi == 0
+        ax.scatter([xi] * len(r["lc_mhd"]), r["lc_mhd"], s=18, color="#4a90d9",
+                   alpha=0.6, zorder=2, label="analogs" if first else None)
+        ax.scatter([xi], [r["lc_mhd_ens"]], marker="D", s=45, color="#1a7d3c",
+                   zorder=3, label="ensemble" if first else None)
+        ax.scatter([xi], [r["lc_mhd_persist"]], marker="x", s=55, color="k",
+                   zorder=3, label="persistence" if first else None)
+    ax.set_ylabel(f"+{lead}d Loop Current front MHD (km)")
+    ax.set_xlabel("SWOT observation day")
+    ax.set_xticks(x)
+    ax.set_xticklabels(obs_days, rotation=45, ha="right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"SWOT-selected analog {lead}-day Loop Current forecast skill "
+                 f"(front MHD; lower = better)")
+    return _save(fig, fname, outdir)
+
+
+def plot_analog_glorys_skill(obs_days, results, lead,
+                             fname="analog_glorys_skill.png", outdir=PLOTS):
+    """Per-obs-day distribution of per-analog skill vs persistence / climatology.
+
+    For each obs day: the K de-clustered analogs' `lead`-day forecast ACC/RMSE
+    (dots), the Gaussian-weighted ensemble mean (diamond) and the dense persistence
+    baseline (x). The deseasonalized climatology sits at ACC = 0 by construction.
+    """
+    x = np.arange(len(obs_days))
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(max(7, 1.1 * len(x) + 2), 7),
+                                 sharex=True)
+    for xi, r in zip(x, results):
+        first = xi == 0
+        a1.scatter([xi] * len(r["acc"]), r["acc"], s=18, color="#4a90d9",
+                   alpha=0.6, zorder=2, label="analogs" if first else None)
+        a1.scatter([xi], [r["acc_ens"]], marker="D", s=45, color="#1a7d3c",
+                   zorder=3, label="ensemble" if first else None)
+        a1.scatter([xi], [r["acc_persist"]], marker="x", s=55, color="k",
+                   zorder=3, label="persistence" if first else None)
+        a2.scatter([xi] * len(r["rmse"]), r["rmse"], s=18, color="#4a90d9", alpha=0.6)
+        a2.scatter([xi], [r["rmse_ens"]], marker="D", s=45, color="#1a7d3c")
+        a2.scatter([xi], [r["rmse_persist"]], marker="x", s=55, color="k")
+    a1.axhline(0, color="gray", lw=0.8)          # deseasonalized climatology floor
+    a1.set_ylabel(f"+{lead}d mesoscale ACC")
+    a2.set_ylabel(f"+{lead}d mesoscale RMSE (m)")
+    a2.set_xlabel("SWOT observation day")
+    a1.set_xticks(x)
+    a1.set_xticklabels(obs_days, rotation=45, ha="right", fontsize=8)
+    for ax in (a1, a2):
+        ax.grid(True, alpha=0.3)
+    a1.legend(loc="upper right", fontsize=8)
+    a1.set_title(f"SWOT-selected analog {lead}-day forecast skill vs dense GLORYS truth "
+                 f"(each analog scored separately)")
+    return _save(fig, fname, outdir)
+
+
+def plot_metric_ladder(variants, rows, persist_acc, persist_lc, lead,
+                       fname="metric_ladder.png", outdir=PLOTS):
+    """Oracle selection ladder: forecast skill as the selection target improves.
+
+    `rows[v]` holds `acc_best/acc_ens/lc_best/lc_ens` for each variant `v` (from the
+    real SWOT metric up to future-oracle). Left panel: full-field ACC (higher=better);
+    right: Loop Current front MHD in km (lower=better). Best-analog and ensemble are
+    shown per variant, with the dense-persistence baseline drawn as a reference line —
+    the gap from `metric-analog` to `present-oracle` says whether a better selection
+    metric could help.
+    """
+    x = np.arange(len(variants))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5))
+
+    a1.plot(x, [rows[v]["acc_best"] for v in variants], "o-", color="#4a90d9",
+            label="best analog", zorder=3)
+    a1.plot(x, [rows[v]["acc_ens"] for v in variants], "D--", color="#1a7d3c",
+            label="ensemble", zorder=3)
+    a1.axhline(persist_acc, color="k", ls=":", lw=1.5, label="persistence")
+    a1.axhline(0, color="gray", lw=0.8)
+    a1.set_ylabel(f"+{lead}d full-field mesoscale ACC  (higher = better)")
+
+    a2.plot(x, [rows[v]["lc_best"] for v in variants], "o-", color="#4a90d9",
+            label="best analog", zorder=3)
+    a2.plot(x, [rows[v]["lc_ens"] for v in variants], "D--", color="#1a7d3c",
+            label="ensemble", zorder=3)
+    a2.axhline(persist_lc, color="k", ls=":", lw=1.5, label="persistence")
+    a2.set_ylabel(f"+{lead}d Loop Current front MHD (km)  (lower = better)")
+
+    for ax in (a1, a2):
+        ax.set_xticks(x)
+        ax.set_xticklabels(variants, rotation=30, ha="right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    fig.suptitle(f"Does a better analog-selection metric help? "
+                 f"(selection target improves left → right, {lead}-day forecast)",
+                 fontsize=12, weight="bold")
+    fig.tight_layout()
+    return _save(fig, fname, outdir)
+
+
+def plot_ceiling(leads, curves, fname="ceiling.png", outdir=PLOTS):
+    """Analog skill-ceiling (oracle) diagnostic: deseasonalized ACC vs lead.
+
+    `curves` maps each strategy name (persistence, metric-analog, present-oracle,
+    future-oracle) to its per-lead mean ACC. The gap from `metric-analog` up to
+    `present-oracle` is the skill a better *current* selection metric could recover
+    (ML headroom); the gap from `persistence` up to `future-oracle` is the library's
+    intrinsic predictability ceiling. Higher is better.
+    """
+    style = {                                        # (color, linestyle, marker)
+        "persistence": ("k", ":", "x"),
+        "metric-analog": ("#4a90d9", "-", "o"),
+        "present-oracle": ("#1a7d3c", "--", "D"),
+        "future-oracle": ("#b5651d", "-.", "s"),
+    }
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for name, vals in curves.items():
+        c, ls, mk = style.get(name, ("gray", "-", "."))
+        ax.plot(leads, vals, color=c, linestyle=ls, marker=mk, label=name, zorder=3)
+    ax.axhline(0, color="gray", lw=0.8)
+    ax.set_xlabel("lead time (days)")
+    ax.set_ylabel("deseasonalized ACC  (higher = better)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    ax.set_title("Analog skill ceiling: is the selection metric or the library the "
+                 "bottleneck?\n(metric-analog → present-oracle = ML headroom; "
+                 "persistence → future-oracle = predictability ceiling)")
     return _save(fig, fname, outdir)
 
 

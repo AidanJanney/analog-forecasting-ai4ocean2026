@@ -1,14 +1,16 @@
 """Pluggable metrics for analog forecasting.
 
-Two independent, user-selectable roles:
-
-* ``AnalogMetric`` — dissimilarity between *observations* (surface fields such
-  as gridded SSH, and eventually SWOT swaths). This is what selects analogs.
-  Default: modified Hausdorff distance between Loop Current fronts (``FrontMHD``).
-
 * ``ErrorMetric`` — score a forecast against truth. The forecast state may span
-  multiple depths, so error metrics operate on arbitrary (..., lat, lon) fields.
-  This need not be the same metric used to pick analogs.
+  multiple depths, so error metrics operate on arbitrary (..., lat, lon) fields,
+  and accept an optional coverage ``mask`` so partial-swath verification works.
+  Reported together: ACC (:class:`AnomalyCorrelation` / :class:`SpatialCorrelation`),
+  RMSE (:class:`WeightedRMSE` / :class:`DemeanedRMSE`) and the Loop Current front
+  MHD in km (:class:`FrontMHDError`).
+
+* ``AnalogMetric`` (below) is the OLD analog-*selection* interface. Selection now
+  lives behind :class:`distances.ObsDistance` (``FrontMHDDistance`` /
+  ``CorrelationDistance``); the classes here are kept only for backward
+  compatibility and are no longer used by the drivers.
 """
 
 from abc import ABC, abstractmethod
@@ -18,8 +20,14 @@ import numpy as np
 from fronts import LEVEL, lon_scale, extract_fronts, front_distance
 
 
+def _mask_2d(mask, shape):
+    """Broadcast a (nlat, nlon) coverage mask over the leading axes of `shape`."""
+    lead = (1,) * (len(shape) - 2)
+    return np.broadcast_to(np.asarray(mask).reshape(lead + tuple(mask.shape)), shape)
+
+
 # --------------------------------------------------------------------------- #
-# Analog selection metrics — operate on surface observations.
+# DEPRECATED analog selection metrics — superseded by distances.ObsDistance.
 # --------------------------------------------------------------------------- #
 class AnalogMetric(ABC):
     """Dissimilarity between observed states, used to rank analogs."""
@@ -107,13 +115,16 @@ class ErrorMetric(ABC):
 
     `t` is the (optional) valid-time index of the fields, used by metrics whose
     reference varies in time (e.g. a seasonal climatology); metrics that don't
-    need it ignore it.
+    need it ignore it. `mask` is an optional (nlat, lon) coverage mask restricting
+    the score to observed cells (e.g. a partial swath); None scores every finite
+    cell. `dense_only` metrics (front geometry) skip partial-coverage truth.
     """
 
     name = "error"
+    dense_only = False
 
     @abstractmethod
-    def __call__(self, forecast, truth, t=None) -> float:
+    def __call__(self, forecast, truth, t=None, mask=None) -> float:
         ...
 
 
@@ -129,14 +140,102 @@ class WeightedRMSE(ErrorMetric):
     def __init__(self, latitude):
         self.wlat = np.cos(np.deg2rad(np.asarray(latitude, dtype=float)))
 
-    def __call__(self, forecast, truth, t=None):
+    def __call__(self, forecast, truth, t=None, mask=None):
         a = np.asarray(forecast)
         b = np.asarray(truth)
         shape = [1] * a.ndim
         shape[-2] = self.wlat.size          # broadcast weights along the lat axis
         w = np.broadcast_to(self.wlat.reshape(shape), a.shape)
         m = np.isfinite(a) & np.isfinite(b)
+        if mask is not None:
+            m = m & _mask_2d(mask, a.shape)
         return float(np.sqrt(np.sum(w[m] * (a[m] - b[m]) ** 2) / np.sum(w[m])))
+
+
+class DemeanedRMSE(ErrorMetric):
+    """Latitude-weighted RMSE of two *anomaly* fields, each de-meaned over the
+    scored cells first — removing any residual offset so the RMSE reflects the
+    pattern + amplitude error (the observation-space RMSE for cross-dataset SSH)."""
+
+    name = "demeaned-RMSE"
+
+    def __init__(self, latitude):
+        self.wlat = np.cos(np.deg2rad(np.asarray(latitude, dtype=float)))[:, None]
+
+    def __call__(self, forecast, truth, t=None, mask=None):
+        a = np.asarray(forecast)
+        b = np.asarray(truth)
+        w2d = np.broadcast_to(self.wlat, a.shape)
+        m = np.isfinite(a) & np.isfinite(b)
+        if mask is not None:
+            m = m & np.asarray(mask)
+        if m.sum() < 10:
+            return np.nan
+        wa, fa, ba = w2d[m], a[m], b[m]
+        W = wa.sum()
+        fa = fa - (wa * fa).sum() / W
+        ba = ba - (wa * ba).sum() / W
+        return float(np.sqrt((wa * (fa - ba) ** 2).sum() / W))
+
+
+class SpatialCorrelation(ErrorMetric):
+    """Latitude-weighted spatial (pattern) correlation over the scored cells.
+
+    The observation-space ACC used for cross-dataset verification: both fields are
+    centered over the observed cells, so it is invariant to a constant offset.
+    Operates on 2-D (lat, lon) anomaly fields. Perfect pattern match = 1."""
+
+    name = "spatial-correlation"
+
+    def __init__(self, latitude):
+        self.wlat = np.cos(np.deg2rad(np.asarray(latitude, dtype=float)))[:, None]
+
+    def __call__(self, forecast, truth, t=None, mask=None):
+        from swot_analog import _weighted_corr
+
+        a = np.asarray(forecast)
+        b = np.asarray(truth)
+        w2d = np.broadcast_to(self.wlat, a.shape)
+        m = np.isfinite(a) & np.isfinite(b)
+        if mask is not None:
+            m = m & np.asarray(mask)
+        if m.sum() < 10:
+            return np.nan
+        return float(_weighted_corr(b[m].astype(np.float32),
+                                    a[m][None, :].astype(np.float32),
+                                    w2d[m].astype(np.float32))[0])
+
+
+class FrontMHDError(ErrorMetric):
+    """Loop Current front position error: modified Hausdorff distance in km.
+
+    Both fields are contoured at the fixed `level`-m ``zos`` isoline (offset-
+    referenced to a common `ref_mean` datum so the contour tracks the front's
+    position, not the basin-scale sea-level offset), and the MHD between the two
+    fronts is returned in km. Lower is better. Requires dense absolute SSH fields —
+    it is skipped on partial-swath / anomaly-only truth (``dense_only``)."""
+
+    name = "front-MHD-km"
+    dense_only = True
+
+    def __init__(self, lon, lat, ocean, ref_mean, level=LEVEL, max_points=200,
+                 deg_km=111.195):
+        self.lon, self.lat, self.ocean = lon, lat, ocean
+        self.ref_mean, self.level, self.max_points = ref_mean, level, max_points
+        self.scale = lon_scale(lat)
+        self.deg_km = deg_km
+
+    def __call__(self, forecast, truth, t=None, mask=None):
+        from fronts import loop_current_front
+
+        f2 = forecast if forecast.ndim == 2 else forecast[0]
+        t2 = truth if truth.ndim == 2 else truth[0]
+        kw = dict(level=self.level, max_points=self.max_points)
+        ff = loop_current_front(f2, self.lon, self.lat, self.ocean, self.ref_mean, **kw)
+        tf = loop_current_front(t2, self.lon, self.lat, self.ocean, self.ref_mean, **kw)
+        if len(ff) == 0 or len(tf) == 0:
+            return np.nan
+        return front_distance(ff, tf, self.scale) * self.deg_km
 
 
 class AnomalyCorrelation(ErrorMetric):
@@ -165,7 +264,7 @@ class AnomalyCorrelation(ErrorMetric):
                              "requires the valid-time index t")
         return self.clim[t]                          # seasonal reference at valid time
 
-    def __call__(self, forecast, truth, t=None):
+    def __call__(self, forecast, truth, t=None, mask=None):
         a = np.asarray(forecast)
         b = np.asarray(truth)
         c = self._reference(a, t)
@@ -175,6 +274,8 @@ class AnomalyCorrelation(ErrorMetric):
         shape[-2] = self.wlat.size
         w = np.broadcast_to(self.wlat.reshape(shape), a.shape)
         m = np.isfinite(a) & np.isfinite(b)
+        if mask is not None:
+            m = m & _mask_2d(mask, a.shape)
         wa = w[m]
         num = np.sum(wa * a[m] * b[m])
         den = np.sqrt(np.sum(wa * a[m] ** 2) * np.sum(wa * b[m] ** 2))

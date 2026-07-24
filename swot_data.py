@@ -126,29 +126,49 @@ def load_swaths(paths, bbox=GOM_BBOX, var=SSHA_VAR, prefer="_PGC0_"):
     """Load many granules, grouped by satellite pass. Returns (swaths, labels).
 
     `swaths` is a list of (lon, lat, ssha) arrays (one per pass, tiles merged);
-    `labels` are "pass <n>  <date> <time>Z" strings. Duplicate processings are
-    dropped by keeping files whose name contains `prefer`.
+    `labels` are "pass <n>  <date> <time>Z" strings.
+
+    A granule exists in several processings (validated ``_PGC0_``, interim
+    ``_PIC0_``) and PO.DAAC subsetting can return byte-identical duplicates
+    (trailing ``_01`` / ``_02``). For each pass (keyed by ``cycle`` + ``pass``
+    number) we keep the ``prefer`` processing when it has in-box pixels, else the
+    alternate — per-pass rather than global, so a preferred file that is empty
+    in-box (its crossover calibration missing/flagged) no longer shadows a good
+    alternate — then collapse exact-duplicate points so a swath is never
+    double-counted.
     """
     import re
     import numpy as np
 
-    files = [p for p in paths if prefer in p] or list(paths)
-    passes = {}
-    for f in sorted(files):
-        mm = re.search(r"_(\d{3})_(\d{3})_(\d{8}T\d{6})", f)
-        key = mm.group(2) if mm else f
+    pat = re.compile(
+        r"_(\d{3})_(\d{3})_(\d{8}T\d{6})_\d{8}T\d{6}_[A-Za-z0-9]+_\d{2}\.nc$")
+
+    # Bucket every granule under its (cycle, pass), tagging preferred processings.
+    groups = {}
+    for f in sorted(paths):
+        mm = pat.search(os.path.basename(f))
         lon, lat, ssha = load_swath(f, bbox=bbox, var=var)
-        if lon.size == 0:
+        if mm:
+            cycle, pas, start = mm.groups()
+            key = (cycle, pas)
+        else:                                    # unrecognised name: keep as-is
+            key, pas, start = (f, None), f, ""
+        g = groups.setdefault(key, {"pas": pas, "start": start, "files": []})
+        g["files"].append((prefer in f, lon, lat, ssha))
+
+    swaths, labels = [], []
+    for _key, g in sorted(groups.items()):
+        pref = [t for t in g["files"] if t[0] and t[3].size]   # non-empty preferred
+        use = pref or [t for t in g["files"] if t[3].size]     # else any non-empty
+        if not use:
             continue
-        if key in passes:
-            p = passes[key]
-            passes[key] = (np.r_[p[0], lon], np.r_[p[1], lat], np.r_[p[2], ssha], p[3])
-        else:
-            t = mm.group(3) if mm else ""
-            passes[key] = (lon, lat, ssha, f"pass {key}  {t[:8]} {t[9:13]}Z")
-    items = sorted(passes.items())
-    swaths = [(v[0], v[1], v[2]) for _, v in items]
-    labels = [v[3] for _, v in items]
+        lon = np.concatenate([t[1] for t in use])
+        lat = np.concatenate([t[2] for t in use])
+        ssha = np.concatenate([t[3] for t in use])
+        _, uniq = np.unique(np.column_stack([lon, lat]), axis=0, return_index=True)
+        lon, lat, ssha = lon[uniq], lat[uniq], ssha[uniq]      # drop duplicate points
+        swaths.append((lon, lat, ssha))
+        labels.append(f"pass {g['pas']}  {g['start'][:8]} {g['start'][9:13]}Z")
     return swaths, labels
 
 
