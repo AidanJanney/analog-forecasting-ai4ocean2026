@@ -1,0 +1,51 @@
+{
+  "shape": [
+    50
+  ],
+  "data_type": "float32",
+  "chunk_grid": {
+    "name": "regular",
+    "configuration": {
+      "chunk_shape": [
+        50
+      ]
+    }
+  },
+  "chunk_key_encoding": {
+    "name": "default",
+    "configuration": {
+      "separator": "/"
+    }
+  },
+  "fill_value": "NaN",
+  "codecs": [
+    {
+      "name": "bytes",
+      "configuration": {
+        "endian": "little"
+      }
+    },
+    {
+      "name": "zstd",
+      "configuration": {
+        "level": 0,
+        "checksum": false
+      }
+    }
+  ],
+  "attributes": {
+    "axis": "Z",
+    "standard_name": "depth",
+    "long_name": "Depth",
+    "positive": "down",
+    "unit_long": "Meters",
+    "units": "m",
+    "_FillValue": "AAAAAAAA+H8="
+  },
+  "dimension_names": [
+    "depth"
+  ],
+  "zarr_format": 3,
+  "node_type": "array",
+  "storage_transformers": []
+}
