@@ -18,8 +18,9 @@ import matplotlib.pyplot as plt
 import viz
 import swot_data
 import swot_analog as sa
-from analog import ModelLibrary, AnalogForecaster
-from distances import CorrelationDistance
+from analog import ModelLibrary, AnalogSelector, Forecast
+from distances import CorrelationDistance, LatentDistance
+from fronts import LEVEL, loop_current_front
 
 # %% ---- CONFIG ----------------------------------------------------------- #
 LIB_CANDIDATES = [
@@ -27,29 +28,41 @@ LIB_CANDIDATES = [
     # "data/glorys_gom_zos_2004.nc",         # single-year fallback
     "data/glorys_gom_zos_thetao_all.nc"
 ]
-TRUTH_PATH = "data/glorys_gom_zos_2024jan.nc"   # dense GLORYS truth over the SWOT era
+TRUTH_PATH = "data/glorys_gom_zos_2024.nc"      # dense GLORYS truth over the SWOT era
+                                                # (2024-01..07; falls back to 2024jan)
 SWOT_DIR = "data/swot"
 K = 10                                     # de-clustered analogs kept per obs day
+K_SHOW = 6                                 # analogs shown in the illustration figures
 MIN_SEP = 14                               # min days between selected analogs
 LEAD = 14                                  # forecast lead time (days)
 MIN_CELLS = 500                            # min observed SWOT cells to use an obs day
-DEMO_DAY = "2024-06-23"                    # obs day shown in the per-analog map figure
+FRONT_COVER_MIN = 0.20                     # min fraction of the Loop Current front the
+                                           # swath must sample (~one clean crossing; a
+                                           # ~120 km swath spans ~15-20% of the front)
+DEMO_DAY = None                            # obs day shown in the per-analog figures;
+                                           # None = auto-pick the best LC-observed day
 # -------------------------------------------------------------------------- #
 
 # %% Load the GLORYS library (analog pool) and the dense 2024 truth.
 lib_path = next((p for p in LIB_CANDIDATES if os.path.exists(p)), LIB_CANDIDATES[-1])
-ds = xr.open_dataset(lib_path).sel(time=slice("1993-01-01", "2023-12-31"))
+ds = xr.open_dataset(lib_path).sel(
+    time=slice("1993-01-01", "2023-12-31") # Date range of the GLORYS library (analog pool)
+)
 times = ds["time"].values
 day = np.datetime_as_string(times, unit="D")
 lib = ModelLibrary(ds, var="zos")
-af = AnalogForecaster(lib, CorrelationDistance())       # obs-space selection (SWOT swath)
+selector = AnalogSelector(lib,
+    CorrelationDistance()       # obs-space correlation over the SWOT swath
+    # LatentDistance(),         # distance in a latent space (e.g., from an autoencoder)
+)
+forecaster = Forecast(lib)      # ensemble mean of the selected analogs
 print(f"Library {lib_path}: {ds.sizes['time']} states, {day[0]} .. {day[-1]}")
 
 truth_ds = xr.open_dataset(TRUTH_PATH)
 truth_times = truth_ds["time"].values
 truth_state = truth_ds["zos"].values
-assert np.allclose(truth_ds["longitude"].values, af.lon) and \
-    np.allclose(truth_ds["latitude"].values, af.lat), "truth grid != library grid"
+assert np.allclose(truth_ds["longitude"].values, lib.lon) and \
+    np.allclose(truth_ds["latitude"].values, lib.lat), "truth grid != library grid"
 tmin, tmax = truth_times.min(), truth_times.max()
 print(f"Truth   {TRUTH_PATH}: {truth_ds.sizes['time']} steps, "
       f"{str(tmin)[:10]} .. {str(tmax)[:10]}")
@@ -66,7 +79,11 @@ swot_paths = sorted(glob.glob(os.path.join(SWOT_DIR, "*.nc")))
 swot_days = sorted({re.search(r"_(\d{8})T", p).group(1) for p in swot_paths})
 obs_days_all = [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in swot_days]
 
-obs_days, results, demo = [], [], None
+# Loop Current fronts share a common datum (the library ocean mean) so the fixed
+# 0.17-m contour tracks the front's position, not the basin-scale sea-level offset.
+ref_mean = float(np.nanmean(lib.mean_surf[lib.ocean]))
+
+obs_days, results, selections, covers, skipped = [], [], [], [], []
 for T in obs_days_all:
     # Skip obs days that don't have a truth field at obs+LEAD.
     vday = np.datetime64(T) + np.timedelta64(LEAD, "D")
@@ -75,33 +92,53 @@ for T in obs_days_all:
 
     # Load the SWOT swath for this obs day, grid it, and skip if too few cells.
     obs_grid, mask = sa.swath_to_grid(swot_data.swaths_for_dates([T])[0],
-                                      af.lon, af.lat)
+                                      lib.lon, lib.lat)
     if mask.sum() < MIN_CELLS:
         continue                                          # too little SWOT coverage
 
-    # Run the analog forecast and verify against the dense truth.
-    r = sa.analog_vs_glorys(af, obs_grid, mask, field_on(vday), vday,
-                            persist_surf=field_on(T), lead=LEAD, k=K, min_sep=MIN_SEP)
+    # Pick only days on which the swath actually samples the Loop Current: locate the
+    # front in the dense GLORYS field at T and require the swath to observe enough of it.
+    gT = field_on(T)
+    lc_front = loop_current_front(gT, lib.lon, lib.lat, lib.ocean, ref_mean, level=LEVEL)
+    cover = sa.front_coverage(lc_front, mask, lib.lon, lib.lat)
+    if cover < FRONT_COVER_MIN:
+        skipped.append((T, cover))
+        continue                                          # Loop Current not observed
+
+    # 1. IDENTIFY analogs (selection), 2. FORECAST them, 3. SCORE vs dense truth
+    selection = selector.select(obs_grid, mask, LEAD, K, min_sep=MIN_SEP)
+    ens = forecaster.forecast(selection, LEAD)
+    r = sa.evaluate(lib, selection, ens, field_on(vday), vday,
+                    persist_surf=gT, lead=LEAD)
     obs_days.append(T)
     results.append(r)
-    if T == DEMO_DAY:
-        demo = (T, obs_grid, mask, r)
-    print(f"obs {T} -> truth {str(vday)[:10]}: Loop Current front MHD (km) "
+    selections.append(selection)
+    covers.append(cover)
+    print(f"obs {T} (LC {cover:.0%} observed) -> truth {str(vday)[:10]}: "
+          f"Loop Current front MHD (km) "
           f"analog best={np.nanmin(r['lc_mhd']):.0f} med={np.nanmedian(r['lc_mhd']):.0f} "
           f"ens={r['lc_mhd_ens']:.0f}  persist={r['lc_mhd_persist']:.0f}   "
           f"[ACC best={np.nanmax(r['acc']):+.2f}]")
 
-print(f"\nUsed {len(obs_days)} obs days (K={K}, min_sep={MIN_SEP}, lead={LEAD}).")
+if skipped:
+    print(f"\nSkipped (Loop Current under-observed, < {FRONT_COVER_MIN:.0%}): "
+          + ", ".join(f"{t} {c:.0%}" for t, c in skipped))
+print(f"\nUsed {len(obs_days)} obs days with the Loop Current observed "
+      f"(K={K}, min_sep={MIN_SEP}, lead={LEAD}).")
 
-# %% Illustration: per-analog forecast vs GLORYS truth for one obs day.
-if demo is None and results:                              # fall back to the first day
-    T0, r0 = obs_days[0], results[0]
-    og0, mk0 = sa.swath_to_grid(swot_data.swaths_for_dates([T0])[0], af.lon, af.lat)
-    demo = (T0, og0, mk0, r0)
-if demo is not None:
-    T0, og0, mk0, r0 = demo
-    viz.plot_analog_glorys_maps(af, T0, og0, mk0, r0["sel"], day, r0["fc_anoms"],
-                                r0["truth"], r0["acc"], LEAD, dist=r0["dist"], k_show=6,
+# %% Illustration for one obs day: (a) which analogs were identified, then
+#    (b) the forecast those analogs produce vs the dense GLORYS truth. Use DEMO_DAY
+#    if it is among the LC-observed days, else the day that best observes the front.
+if results:
+    di = obs_days.index(DEMO_DAY) if DEMO_DAY in obs_days else int(np.argmax(covers))
+    T0, r0, sel0 = obs_days[di], results[di], selections[di]
+    og0, mk0 = sa.swath_to_grid(swot_data.swaths_for_dates([T0])[0], lib.lon, lib.lat)
+    print(f"\nDemo day: {T0} (Loop Current {covers[di]:.0%} observed)")
+    # (a) The identified analogs: the SWOT swath beside its top-K GLORYS matches.
+    viz.plot_swot_analogs(og0, mk0, lib, sel0.indices, sel0.distances, day, k=K_SHOW)
+    # (b) The forecast from those analogs (selection reused, not recomputed).
+    viz.plot_analog_glorys_maps(lib, T0, og0, mk0, r0["sel"], day, r0["fc_anoms"],
+                                r0["truth"], r0["acc"], LEAD, dist=r0["dist"], k_show=K_SHOW,
                                 fc_fronts=r0["fc_fronts"], truth_front=r0["truth_front"],
                                 lc_mhd=r0["lc_mhd"], init_anom=r0["init"],
                                 init_front=r0["persist_front"])

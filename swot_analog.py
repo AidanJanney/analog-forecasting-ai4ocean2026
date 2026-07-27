@@ -1,26 +1,23 @@
 """SWOT-driven analog helpers: swath gridding, the correlation kernel, and the
-dense-GLORYS evaluation used by the SWOT→GLORYS diagnostics.
+dense-GLORYS scoring used by the SWOT→GLORYS diagnostics.
 
-The forecaster itself now lives in :mod:`analog` (:class:`analog.AnalogForecaster`,
-built from a :class:`analog.ModelLibrary` + a :class:`distances.ObsDistance`). This
-module keeps the pieces that are specific to *comparing a partial swath against the
-model*:
+Selection and forecasting live in :mod:`analog` (:class:`analog.AnalogSelector`,
+:class:`analog.Forecast`); this module keeps only the SWOT-specific pieces:
 
-1. **Coverage** — a SWOT day is only a few partial swaths. :func:`swath_to_grid`
-   bins the swath onto the model grid, yielding a coverage mask and averaging SWOT
-   (~2 km, noisy) down to the grid resolution (~8 km).
-2. **Quantity** — SWOT ``ssha`` is an anomaly relative to a mean sea surface while
-   GLORYS ``zos`` is absolute topography; :func:`_weighted_corr` compares *patterns*
-   over the observed cells, invariant to the residual offset (this kernel backs
-   ``distances.CorrelationDistance``).
-
-:func:`aggregate_skill` (verified on future swaths) and :func:`analog_vs_glorys`
-(verified on dense GLORYS) both take a unified :class:`analog.AnalogForecaster`.
+* :func:`swath_to_grid` — bin a partial swath onto the model grid (+ coverage mask);
+* :func:`_weighted_corr` — the offset-invariant pattern-correlation kernel (backs
+  ``distances.CorrelationDistance`` and the ACC/RMSE error metrics);
+* :func:`aggregate_skill` — mean ACC/RMSE per lead verified on *future SWOT swaths*;
+* :func:`evaluate` — score an already-selected, already-forecast analog set against
+  a *dense* GLORYS field (per-analog + ensemble + persistence ACC/RMSE + Loop Current
+  front MHD). It neither selects nor combines — the caller does
+  ``sel = selector.select(...)`` then ``ens = forecaster.forecast(sel, lead)``.
 """
 
 import numpy as np
 
-from fronts import LEVEL, lon_scale, front_distance, loop_current_front as _lc_front
+from fronts import LEVEL, lon_scale, front_distance, loop_current_front
+from metrics import SpatialCorrelation, DemeanedRMSE
 
 
 def _edges(centers):
@@ -77,32 +74,35 @@ def _weighted_corr(o, X, w):
     return corr
 
 
-def loop_current_front(af, field, ref_mean, level=LEVEL, max_points=200,
-                       main_only=True):
-    """Back-compat wrapper: Loop Current front of `field` using `af`'s grid/ocean.
+def front_coverage(front, mask, lon, lat):
+    """Fraction of a front's grid cells that fall inside the swath `mask`.
 
-    Delegates to :func:`fronts.loop_current_front`; kept so callers holding a
-    forecaster can extract a front without threading grid arrays through.
+    Rasterizes the front's (lon, lat) vertices onto the model grid and returns the
+    fraction of the cells it passes through that the swath observed — a measure of
+    whether a SWOT pass actually *sampled the Loop Current* on this day (vs. merely
+    covering enough ocean somewhere in the box). Returns 0 for an empty front.
     """
-    return _lc_front(field, af.lon, af.lat, af.ocean, ref_mean, level=level,
-                     max_points=max_points, main_only=main_only)
+    if len(front) == 0:
+        return 0.0
+    jx = np.round((front[:, 0] - lon[0]) / (lon[1] - lon[0])).astype(int)
+    iy = np.round((front[:, 1] - lat[0]) / (lat[1] - lat[0])).astype(int)
+    ok = (jx >= 0) & (jx < lon.size) & (iy >= 0) & (iy < lat.size)
+    cells = set(zip(iy[ok].tolist(), jx[ok].tolist()))     # unique grid cells on the front
+    if not cells:
+        return 0.0
+    return sum(bool(mask[i, j]) for i, j in cells) / len(cells)
 
 
-def aggregate_skill(af, obs_days, leads, swaths_for, k=15, min_cells=500,
-                    deseasonalize=True):
-    """Mean ACC and RMSE per lead over every available (obs-day, lead) pair,
-    verified against the *future SWOT swath* (partial coverage).
+def aggregate_skill(selector, forecaster, obs_days, leads, swaths_for, k=15,
+                    min_cells=500, deseasonalize=True):
+    """Mean ACC and RMSE per lead over every (obs-day, lead) pair, verified against
+    the *future SWOT swath* (partial coverage).
 
-    Parameters
-    ----------
-    af : analog.AnalogForecaster (built with a CorrelationDistance over the library).
-    obs_days : list of 'YYYY-MM-DD' strings that have SWOT swaths on disk.
-    leads : iterable of lead times (days).
-    swaths_for : callable, ``swaths_for(['YYYY-MM-DD', ...]) -> list of swaths``.
-    k, min_cells : analogs kept; minimum observed cells to use an obs/verify day.
-    deseasonalize : subtract the day-of-year seasonal climatology from both the
-        forecast and the SWOT truth before scoring, so skill reflects the mesoscale
-        residual and the climatology baseline collapses to ~0 ACC.
+    Selection and forecasting are the decoupled ``analog`` pieces: for each obs day
+    the analogs are ``selector.select(obs_grid, mask, lead, k)`` and the forecast is
+    ``forecaster.forecast(sel, lead)``. Persistence is the analog nowcast (lead-0
+    forecast). `deseasonalize` subtracts the day-of-year seasonal climatology from
+    forecast and SWOT truth so skill is mesoscale and climatology collapses to ~0.
 
     Returns (leads, acc, rmse, counts) — `acc`/`rmse` dicts keyed by
     {"analog","persistence","climatology"} of per-lead mean arrays.
@@ -110,6 +110,8 @@ def aggregate_skill(af, obs_days, leads, swaths_for, k=15, min_cells=500,
     def _swaths(x):
         return x[0] if isinstance(x, tuple) else x
 
+    lib = selector.lib
+    acc_m, rmse_m = SpatialCorrelation(lib.lat), DemeanedRMSE(lib.lat)
     names = ["analog", "persistence", "climatology"]
     leads = list(leads)
     acc = {n: {L: [] for L in leads} for n in names}
@@ -117,28 +119,28 @@ def aggregate_skill(af, obs_days, leads, swaths_for, k=15, min_cells=500,
     have = set(obs_days)
     for d0 in obs_days:
         t0 = np.datetime64(d0)
-        obs_grid, mask = swath_to_grid(_swaths(swaths_for([d0])), af.lon, af.lat)
+        obs_grid, mask = swath_to_grid(_swaths(swaths_for([d0])), lib.lon, lib.lat)
         if mask.sum() < min_cells:
             continue
-        persist = af.anom_of(af.forecast_obs(obs_grid, mask, 0, k=k)[0])   # analog nowcast
+        persist = lib.anom_of(forecaster.forecast(selector.select(obs_grid, mask, 0, k), 0))
         for L in leads:
             vday = t0 + np.timedelta64(int(L), "D")
             if str(vday) not in have:
                 continue
-            obs2, mask2 = swath_to_grid(_swaths(swaths_for([str(vday)])), af.lon, af.lat)
+            obs2, mask2 = swath_to_grid(_swaths(swaths_for([str(vday)])), lib.lon, lib.lat)
             if mask2.sum() < min_cells:
                 continue
-            fc = af.forecast_obs(obs_grid, mask, int(L), k=k)[0]
-            fields = {"analog": af.anom_of(fc), "persistence": persist,
-                      "climatology": af.clim_anomaly(vday)}
+            fc = forecaster.forecast(selector.select(obs_grid, mask, int(L), k), int(L))
+            fields = {"analog": lib.anom_of(fc), "persistence": persist,
+                      "climatology": lib.clim_anomaly(vday)}
             truth = obs2
             if deseasonalize:
-                cav = af.clim_anomaly(vday)
+                cav = lib.clim_anomaly(vday)
                 fields = {n: fa - cav for n, fa in fields.items()}
                 truth = obs2 - cav
             for n, fa in fields.items():
-                acc[n][L].append(af.score(fa, truth, mask2))
-                rmse[n][L].append(af.score_rmse(fa, truth, mask2))
+                acc[n][L].append(acc_m(fa, truth, mask=mask2))
+                rmse[n][L].append(rmse_m(fa, truth, mask=mask2))
 
     def means(dct):
         return {n: np.array([np.nanmean(dct[n][L]) if dct[n][L] else np.nan
@@ -148,59 +150,66 @@ def aggregate_skill(af, obs_days, leads, swaths_for, k=15, min_cells=500,
     return leads, means(acc), means(rmse), counts
 
 
-def analog_vs_glorys(af, obs_grid, mask, truth_surf, vday, persist_surf=None,
-                     lead=14, k=10, min_sep=14, lc_level=LEVEL):
-    """Score each analog's `lead`-day forecast against dense GLORYS.
+def evaluate(library, analogs, ens_forecast, truth_surf, vday, persist_surf=None,
+             lead=14, lc_level=LEVEL):
+    """Score an analog selection's forecast against a *dense* GLORYS field.
 
-    The K analogs (de-clustered `min_sep` days apart) are selected from the
-    observation (`obs_grid`, `mask`); each analog's forecast ``state[a_i + lead]``
-    is scored separately alongside the Gaussian-weighted ensemble mean and (if
-    `persist_surf` is given) a dense persistence baseline. All fields are
+    Pure scoring — it does **not** select or combine. Pass ``analogs`` (an
+    :class:`analog.AnalogSet` from ``AnalogSelector.select``) and ``ens_forecast``
+    (the ensemble field from ``Forecast.forecast``). Each analog's own future
+    (``state[i + lead]``) is scored separately alongside the ensemble and, if
+    `persist_surf` is given, a dense persistence baseline. All fields are
     deseasonalized at `vday`. Skill: full-field ACC/RMSE and the Loop Current front
-    MHD (km). Returns a dict of indices/distances, per-analog forecast anomalies,
-    the truth, the truth initial condition (``init``: `persist_surf` deseasonalized at
-    the obs day), ACC/RMSE/MHD per analog + ensemble + persistence, and the fronts.
+    MHD (km). Returns the dict the SWOT→GLORYS figures consume — including the truth
+    initial condition (``init``: `persist_surf` deseasonalized at the obs day) and
+    the extracted fronts.
     """
-    sel, dist = af.analogs_obs(obs_grid, mask, lead, k, min_sep=min_sep)
-    truth = af.deseasonalize(af.anom_of(truth_surf), vday)
-    ocean = af.ocean
+    lib = library
+    sel, dist = analogs.indices, analogs.distances
+    acc_m, rmse_m = SpatialCorrelation(lib.lat), DemeanedRMSE(lib.lat)
+    ocean = lib.ocean
 
-    fc_anoms = [af.deseasonalize(af.anom_of(af.state[i + lead]), vday) for i in sel]
-    acc = np.array([af.score(f, truth, ocean) for f in fc_anoms])
-    rmse = np.array([af.score_rmse(f, truth, ocean) for f in fc_anoms])
+    def dz(field, when=vday):
+        return lib.deseasonalize(lib.anom_of(field), when)
 
-    w = np.exp(-(dist / dist.mean()) ** 2)
-    ens = np.tensordot(w, af.state[sel + lead], axes=1) / w.sum()
-    ens_anom = af.deseasonalize(af.anom_of(ens), vday)
-    acc_ens = af.score(ens_anom, truth, ocean)
-    rmse_ens = af.score_rmse(ens_anom, truth, ocean)
+    truth = dz(truth_surf)
+    fc_anoms = [dz(lib.state[i + lead]) for i in sel]
+    acc = np.array([acc_m(f, truth, mask=ocean) for f in fc_anoms])
+    rmse = np.array([rmse_m(f, truth, mask=ocean) for f in fc_anoms])
+
+    ens_anom = dz(ens_forecast)
+    acc_ens = acc_m(ens_anom, truth, mask=ocean)
+    rmse_ens = rmse_m(ens_anom, truth, mask=ocean)
 
     acc_persist = rmse_persist = np.nan
     init_anom = None
     if persist_surf is not None:
-        p = af.deseasonalize(af.anom_of(persist_surf), vday)
-        acc_persist = af.score(p, truth, ocean)
-        rmse_persist = af.score_rmse(p, truth, ocean)
-        # Same field deseasonalized at its own (obs) date: the truth initial condition.
+        p = dz(persist_surf)
+        acc_persist = acc_m(p, truth, mask=ocean)
+        rmse_persist = rmse_m(p, truth, mask=ocean)
         oday = np.datetime64(vday) - np.timedelta64(int(lead), "D")
-        init_anom = af.deseasonalize(af.anom_of(persist_surf), oday)
+        init_anom = dz(persist_surf, oday)          # initial condition (obs day)
 
     # --- Loop Current skill: MHD (km) between forecast and truth fronts --- #
-    scale = lon_scale(af.lat)
-    ref_mean = float(np.nanmean(af.mean_surf[ocean]))
+    scale = lon_scale(lib.lat)
+    ref_mean = float(np.nanmean(lib.mean_surf[ocean]))
     deg_km = 111.195
-    truth_front = loop_current_front(af, truth_surf, ref_mean, level=lc_level)
+
+    def front(field):
+        return loop_current_front(field, lib.lon, lib.lat, ocean, ref_mean, level=lc_level)
+
+    truth_front = front(truth_surf)
 
     def _lc(field):
-        f = loop_current_front(af, field, ref_mean, level=lc_level)
+        f = front(field)
         if len(f) == 0 or len(truth_front) == 0:
             return np.nan, f
         return front_distance(f, truth_front, scale) * deg_km, f
 
-    lc = [_lc(af.state[i + lead]) for i in sel]
+    lc = [_lc(lib.state[i + lead]) for i in sel]
     lc_mhd = np.array([d for d, _ in lc])
     fc_fronts = [f for _, f in lc]
-    lc_mhd_ens, ens_front = _lc(ens)
+    lc_mhd_ens, ens_front = _lc(ens_forecast)
     lc_mhd_persist, persist_front = (_lc(persist_surf) if persist_surf is not None
                                      else (np.nan, np.empty((0, 2))))
 

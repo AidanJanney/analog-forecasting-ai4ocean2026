@@ -16,8 +16,9 @@ import matplotlib.pyplot as plt
 import viz
 import swot_data
 import swot_analog as sa
-from analog import ModelLibrary, AnalogForecaster
+from analog import ModelLibrary, AnalogSelector, Forecast
 from distances import CorrelationDistance
+from metrics import SpatialCorrelation
 
 # %% ---- CONFIG ----------------------------------------------------------- #
 DATA_CANDIDATES = [
@@ -59,37 +60,42 @@ else:
 # selected in observation space with CorrelationDistance (no temporal exclusion —
 # the SWOT era and the library are disjoint).
 if swot_paths:
-    af = AnalogForecaster(lib, CorrelationDistance())
+    selector = AnalogSelector(lib, CorrelationDistance())   # obs-space selection
+    forecaster = Forecast(lib)                              # ensemble-mean of the analogs
+    acc_metric = SpatialCorrelation(lib.lat)                # obs-space ACC (pattern corr)
     swot_days = sorted({re.search(r"_(\d{8})T", p).group(1) for p in swot_paths})
     obs_days = [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in swot_days]        # all days present
 
     # --- illustration: analogs of the earliest obs, and a forecast map ---
     illo = obs_days[:2]
     obs_grid, obs_mask = sa.swath_to_grid(swot_data.swaths_for_dates(illo)[0],
-                                          af.lon, af.lat)
-    sel, dist = af.analogs_obs(obs_grid, obs_mask, 0, K_SHOW)
+                                          lib.lon, lib.lat)
+    selection = selector.select(obs_grid, obs_mask, 0, K_SHOW)         # identify analogs
+    sel, dist = selection.indices, selection.distances
     print(f"SWOT obs {illo[0]}: best GLORYS analog {day[sel[0]]} (r={1 - dist.min():.2f})")
-    viz.plot_swot_analogs(obs_grid, obs_mask, af, sel, dist, day, k=K_SHOW)
+    viz.plot_swot_analogs(obs_grid, obs_mask, lib, sel, dist, day, k=K_SHOW)
 
     t0 = np.datetime64(illo[0])
     results = []
     for L in DEMO_LEADS:
         vday = t0 + np.timedelta64(L, "D")
         obs2, mask2 = sa.swath_to_grid(
-            swot_data.swaths_for_dates([str(vday)])[0], af.lon, af.lat)
+            swot_data.swaths_for_dates([str(vday)])[0], lib.lon, lib.lat)
         if mask2.sum() < MIN_CELLS:
             continue
-        # Deseasonalize forecast and truth so the maps/score show mesoscale skill.
-        fc_anom = af.deseasonalize(af.anom_of(af.forecast_obs(obs_grid, obs_mask, L, k=K)[0]), vday)
-        obs2 = af.deseasonalize(obs2, vday)
+        # Select, forecast, deseasonalize forecast + truth (mesoscale skill).
+        fc = forecaster.forecast(selector.select(obs_grid, obs_mask, L, K), L)
+        fc_anom = lib.deseasonalize(lib.anom_of(fc), vday)
+        obs2 = lib.deseasonalize(obs2, vday)
         results.append(dict(L=L, fc_anom=fc_anom, obs2=obs2, mask2=mask2,
-                            r_analog=af.score(fc_anom, obs2, mask2)))
+                            r_analog=acc_metric(fc_anom, obs2, mask=mask2)))
     if results:
-        viz.plot_swot_forecast(af, illo[0], results)
+        viz.plot_swot_forecast(lib, illo[0], results)
 
     # --- aggregated skill (ACC + RMSE) over every obs day ---
     leads, acc, rmse, counts = sa.aggregate_skill(
-        af, obs_days, SWOT_LEADS, swot_data.swaths_for_dates, k=K, min_cells=MIN_CELLS)
+        selector, forecaster, obs_days, SWOT_LEADS, swot_data.swaths_for_dates,
+        k=K, min_cells=MIN_CELLS)
     viz.plot_swot_skill(leads, acc, rmse, counts, n_obs=len(obs_days))
     good = [i for i, c in enumerate(counts) if c]
     if good:

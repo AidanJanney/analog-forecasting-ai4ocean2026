@@ -2,7 +2,7 @@
 
 Each function builds one figure, saves it under `outdir` (default ``plots/``),
 and returns the figure. They take already-computed inputs (fronts, dissimilarity
-matrix, an ``AnalogForecaster``) so the orchestration lives in ``main.py``.
+matrix, a ``ModelLibrary`` / ``Forecast``) so the orchestration lives in ``main.py``.
 """
 
 import os
@@ -116,17 +116,28 @@ def plot_front_pairs(D, contours, times, min_sep=30, outdir=PLOTS):
 # --------------------------------------------------------------------------- #
 # Forecasting
 # --------------------------------------------------------------------------- #
-def plot_forecast_demo(af, t0, lead, day, forecast_var="", analog_name="",
-                       units="", plot_depth=0, k=10, exclude=5, outdir=PLOTS):
-    """Truth / analog forecast / persistence / error, verified against baselines."""
+def plot_forecast_demo(selector, forecaster, lib, error_metric, t0, lead, day,
+                       forecast_var="", analog_name="", units="", plot_depth=0,
+                       k=10, exclude=5, outdir=PLOTS):
+    """Truth / analog forecast / persistence / error, verified against baselines.
+
+    Composes the decoupled pieces: ``selector.select`` (self-source) then
+    ``forecaster.forecast``; scores with `error_metric`.
+    """
     V = t0 + lead
-    fc, sel, d_sel = af.forecast(t0, lead, k=k, exclude=exclude)
-    truth = af.truth(V)
+    sel_set = selector.select(lib.surf[t0], lib.ocean, lead, k, exclude=exclude,
+                              self_index=t0)
+    fc = forecaster.forecast(sel_set, lead)
+    sel, truth = sel_set.indices, lib.state[V]
+
+    def err(field):
+        return error_metric(field, truth, t=V, mask=lib.ocean)
+
     print(f"Forecast {day[t0]} + {lead}d  ->  {day[V]}")
     print(f"  analogs: {', '.join(day[sel])}")
-    print(f"  analog      = {af.error(fc, truth, V):.4f}")
-    print(f"  persistence = {af.error(af.truth(t0), truth, V):.4f}")
-    print(f"  climatology = {af.error(af.clim_forecast(V), truth, V):.4f}")
+    print(f"  analog      = {err(fc):.4f}")
+    print(f"  persistence = {err(lib.state[t0]):.4f}")
+    print(f"  climatology = {err(lib.clim_forecast(V)):.4f}")
 
     def to2d(field):
         return field if field.ndim == 2 else field[plot_depth]
@@ -138,7 +149,7 @@ def plot_forecast_demo(af, t0, lead, day, forecast_var="", analog_name="",
     for a, field, title in [
         (axf[0, 0], t2d, f"truth  {day[t0 + lead]}"),
         (axf[0, 1], f2d, "analog forecast"),
-        (axf[1, 0], to2d(af.truth(t0)), f"persistence  {day[t0]}"),
+        (axf[1, 0], to2d(lib.state[t0]), f"persistence  {day[t0]}"),
     ]:
         imf = a.imshow(field, **kw)
         a.set_title(title)
@@ -210,17 +221,17 @@ def plot_swot_panels(swaths, labels, bbox=None, vmax=None,
     return _save(fig, fname, outdir)
 
 
-def plot_swot_analogs(obs_grid, mask, af, sel, dist, day, k=None,
+def plot_swot_analogs(obs_grid, mask, lib, sel, dist, day, k=None,
                       fname="swot_analogs.png", outdir=PLOTS):
     """Binned SWOT observation beside its top GLORYS analog anomaly fields.
 
-    `af` is an analog.AnalogForecaster; `sel`/`dist` are analog indices and
+    `lib` is a ModelLibrary; `sel`/`dist` are analog indices and
     distances (1 - correlation). The swath footprint is outlined on each analog so
     the eye can check the match where SWOT observed.
     """
     k = len(sel) if k is None else min(k, len(sel))
     obs = np.where(mask, obs_grid, np.nan)
-    fields = [af.anom[i] for i in sel[:k]]
+    fields = [lib.anom[i] for i in sel[:k]]
     pool = np.concatenate([obs[np.isfinite(obs)]]
                           + [f[np.isfinite(f)] for f in fields])
     vmax = float(np.nanpercentile(np.abs(pool), 98))
@@ -252,7 +263,7 @@ def plot_swot_analogs(obs_grid, mask, af, sel, dist, day, k=None,
     return _save(fig, fname, outdir, dpi=180)
 
 
-def plot_swot_forecast(af, obs_date, results, fname="swot_forecast.png", outdir=PLOTS):
+def plot_swot_forecast(lib, obs_date, results, fname="swot_forecast.png", outdir=PLOTS):
     """Per-lead: SWOT-driven dense forecast (anomaly) beside the future SWOT truth.
 
     `results` is a list of dicts with keys L, fc_anom, obs2, mask2, r_analog.
@@ -265,7 +276,7 @@ def plot_swot_forecast(af, obs_date, results, fname="swot_forecast.png", outdir=
     kw = dict(origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
 
     nrow = len(results)
-    aspect_wh = af.anom.shape[2] / af.anom.shape[1]
+    aspect_wh = lib.anom.shape[2] / lib.anom.shape[1]
     ph = 2.0
     fig, ax = plt.subplots(nrow, 2, figsize=(2 * ph * aspect_wh + 1.2, nrow * ph + 1.4),
                            constrained_layout=True, squeeze=False)
@@ -329,7 +340,7 @@ def _front_px(front, lon, lat):
     return px, py
 
 
-def plot_analog_glorys_maps(saf, obs_day, obs_grid, mask, sel, day, fc_anoms,
+def plot_analog_glorys_maps(lib, obs_day, obs_grid, mask, sel, day, fc_anoms,
                             truth_anom, accs, lead, dist=None, k_show=6,
                             fc_fronts=None, truth_front=None, lc_mhd=None,
                             init_anom=None, init_front=None,
@@ -350,15 +361,15 @@ def plot_analog_glorys_maps(saf, obs_day, obs_grid, mask, sel, day, fc_anoms,
     diverging scale.
     """
     k = min(k_show, len(sel))
-    sel_fields = [saf.deseasonalize(saf.anom[i], saf.times[i]) for i in sel[:k]]
+    sel_fields = [lib.deseasonalize(lib.anom[i], lib.times[i]) for i in sel[:k]]
     fcs = fc_anoms[:k]
     pool = np.concatenate([truth_anom[np.isfinite(truth_anom)]]
                           + ([] if init_anom is None else [init_anom[np.isfinite(init_anom)]])
                           + [f[np.isfinite(f)] for f in sel_fields + list(fcs)])
     vmax = float(np.nanpercentile(np.abs(pool), 98))
     kw = dict(origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
-    tf_px = _front_px(truth_front, saf.lon, saf.lat)
-    if_px = _front_px(init_front, saf.lon, saf.lat)
+    tf_px = _front_px(truth_front, lib.lon, lib.lat)
+    if_px = _front_px(init_front, lib.lon, lib.lat)
     # SWOT ssha is referenced to a mean sea surface, zos to the library mean: the
     # selection kernel is offset-invariant, so show the swath with its offset removed.
     obs_show = np.where(mask, obs_grid - np.nanmean(obs_grid[mask]), np.nan)
@@ -396,7 +407,7 @@ def plot_analog_glorys_maps(saf, obs_day, obs_grid, mask, sel, day, fc_anoms,
         a_fc = ax[r, c["forecast"]]
         im = a_fc.imshow(fcs[r], **kw)
         if fc_fronts is not None:                       # forecast LC front (green)
-            fx, fy = _front_px(fc_fronts[r], saf.lon, saf.lat)
+            fx, fy = _front_px(fc_fronts[r], lib.lon, lib.lat)
             a_fc.plot(fx, fy, ".", ms=1.1, color="#127a2e")
         a_fc.plot(*tf_px, ".", ms=0.8, color="k", alpha=0.7)      # truth front
         lc = "" if lc_mhd is None else f"   LC={lc_mhd[r]:.0f}km"
@@ -560,12 +571,15 @@ def plot_ceiling(leads, curves, fname="ceiling.png", outdir=PLOTS):
     return _save(fig, fname, outdir)
 
 
-def plot_analog_ensemble(af, t0, leads, day, k=8, exclude=30, units="",
-                         plot_depth=0, fname="analog_ensemble.png", outdir=PLOTS):
+def plot_analog_ensemble(selector, forecaster, lib, error_metric, t0, leads, day,
+                         k=8, exclude=30, units="", plot_depth=0,
+                         fname="analog_ensemble.png", outdir=PLOTS):
     """Visualise one analog forecast at one or more lead times.
 
-    The K analogs are selected once (from the target's front); each is then
-    advanced to every requested lead. Layout — columns are
+    The K analogs are *selected once* (``selector.select`` at the max lead) and the
+    same :class:`~analog.AnalogSet` is forecast at every requested lead
+    (``forecaster.forecast``) — a direct illustration of the select-once /
+    forecast-many decoupling. Layout — columns are
     ``analog_1 .. analog_K | forecast | target/truth | error``:
       row 0        — analogs at their *selection* time, plus the target
       one row/lead — analog futures, the weighted-average forecast, truth, error
@@ -573,21 +587,21 @@ def plot_analog_ensemble(af, t0, leads, day, k=8, exclude=30, units="",
     """
     leads = [leads] if np.isscalar(leads) else list(leads)
     Lmax = max(leads)
-    sel, d_sel = af.analogs(t0, Lmax, k, exclude)    # one analog set for all leads
-    w = np.exp(-(d_sel / d_sel.mean()) ** 2)
-    w = w / w.sum()                                  # normalised weights (sum to 1)
+    sel_set = selector.select(lib.surf[t0], lib.ocean, Lmax, k, exclude=exclude,
+                              self_index=t0)                # one analog set for all leads
+    sel, w = sel_set.indices, sel_set.weights              # combiner's ensemble weights
 
     def to2d(f):
         return f if f.ndim == 2 else f[plot_depth]
 
-    tar = to2d(af.truth(t0))
+    tar = to2d(lib.state[t0])
     truths, fcasts, errs, accs = {}, {}, {}, {}
     for L in leads:
-        fc = np.tensordot(w, af.state[sel + L], axes=1)   # weighted mean of futures
-        tr = af.truth(t0 + L)
+        fc = forecaster.forecast(sel_set, L)               # combine at this lead
+        tr = lib.state[t0 + L]
         truths[L], fcasts[L] = to2d(tr), to2d(fc)
         errs[L] = fcasts[L] - truths[L]
-        accs[L] = af.error(fc, tr, t0 + L)
+        accs[L] = error_metric(fc, tr, t=t0 + L, mask=lib.ocean)
 
     # shared colour scales: one for SSH fields, one for errors (across leads)
     ssh = np.concatenate([tar[np.isfinite(tar)]]
@@ -612,7 +626,7 @@ def plot_analog_ensemble(af, t0, leads, day, k=8, exclude=30, units="",
     # -- selection row: the K analogs, then the target --
     im_ssh = None
     for c, (a, wi) in enumerate(zip(sel, w)):
-        im_ssh = ax[0, c].imshow(to2d(af.truth(a)), **kw)
+        im_ssh = ax[0, c].imshow(to2d(lib.state[a]), **kw)
         ax[0, c].set_title(f"analog {c + 1}\n{day[a]}  w={wi * 100:.0f}%", fontsize=8)
     ax[0, cF].axis("off")
     ax[0, cE].axis("off")
@@ -623,7 +637,7 @@ def plot_analog_ensemble(af, t0, leads, day, k=8, exclude=30, units="",
     im_err = None
     for r, L in enumerate(leads, start=1):
         for c, a in enumerate(sel):
-            ax[r, c].imshow(to2d(af.truth(a + L)), **kw)
+            ax[r, c].imshow(to2d(lib.state[a + L]), **kw)
             ax[r, c].set_title(f"+{L}d", fontsize=7)
         ax[r, cF].imshow(fcasts[L], **kw)
         ax[r, cF].set_title(f"FORECAST +{L}d\nACC={accs[L]:.3f}", fontsize=8, weight="bold")

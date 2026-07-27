@@ -2,7 +2,7 @@
 # The SWOT-driven forecast loses to dense persistence. To find out whether the
 # *selection metric* is the bottleneck (vs. a predictability ceiling), we re-select
 # analogs using targets a real metric can't have and score the forecasts identically.
-# Because `analog_vs_glorys` chooses analogs ONLY from (obs_grid, mask), each rung is
+# Because selection depends ONLY on (obs_grid, mask), each rung is
 # one call with a different selection target:
 #
 #   metric-analog        SWOT swath  + swath mask      the real metric (current)
@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import viz
 import swot_data
 import swot_analog as sa
-from analog import ModelLibrary, AnalogForecaster, seasonal_climatology
+from analog import ModelLibrary, AnalogSelector, Forecast, seasonal_climatology
 from distances import CorrelationDistance
 
 # %% ---- CONFIG ----------------------------------------------------------- #
@@ -42,17 +42,19 @@ lib_path = next((p for p in LIB_CANDIDATES if os.path.exists(p)), LIB_CANDIDATES
 ds = xr.open_dataset(lib_path)
 times = ds["time"].values
 state = ds["zos"].values
-saf = AnalogForecaster(ModelLibrary(ds, var="zos"), CorrelationDistance())    # seasonal-kept
-deseas_anom = state - seasonal_climatology(state, times)              # mesoscale residual
-saf_ds = AnalogForecaster(ModelLibrary(ds, var="zos", anomaly=deseas_anom),
-                          CorrelationDistance())                      # mesoscale selection
+lib = ModelLibrary(ds, var="zos")                                    # seasonal-kept selection
+deseas_anom = state - seasonal_climatology(state, times)             # mesoscale residual
+lib_ds = ModelLibrary(ds, var="zos", anomaly=deseas_anom)            # mesoscale selection
+selector = AnalogSelector(lib, CorrelationDistance())
+selector_ds = AnalogSelector(lib_ds, CorrelationDistance())
+forecaster = Forecast(lib)                    # same state library; scoring uses `lib`
 print(f"Library {lib_path}: {ds.sizes['time']} states")
 
 truth_ds = xr.open_dataset(TRUTH_PATH)
 truth_times = truth_ds["time"].values
 truth_state = truth_ds["zos"].values
-assert np.allclose(truth_ds["longitude"].values, saf.lon) and \
-    np.allclose(truth_ds["latitude"].values, saf.lat), "truth grid != library grid"
+assert np.allclose(truth_ds["longitude"].values, lib.lon) and \
+    np.allclose(truth_ds["latitude"].values, lib.lat), "truth grid != library grid"
 tmin, tmax = truth_times.min(), truth_times.max()
 
 
@@ -62,38 +64,39 @@ def field_on(date64):
     return truth_state[i]
 
 
-# %% Per obs day: run the selection ladder; every rung is one analog_vs_glorys call.
+# %% Per obs day: run the selection ladder; every rung = select -> forecast -> evaluate.
 swot_paths = sorted(glob.glob(os.path.join(SWOT_DIR, "*.nc")))
 swot_days = sorted({re.search(r"_(\d{8})T", p).group(1) for p in swot_paths})
 obs_days_all = [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in swot_days]
 
 VARIANTS = ["metric-analog", "obs-oracle (mask)", "present-oracle",
             "present-oracle (ds)", "future-oracle"]
-runs = {v: [] for v in VARIANTS}          # per-variant list of analog_vs_glorys results
+runs = {v: [] for v in VARIANTS}          # per-variant list of evaluate() results
 obs_days = []
 
 for T in obs_days_all:
     vday = np.datetime64(T) + np.timedelta64(LEAD, "D")
     if not (tmin <= vday <= tmax):
         continue
-    obs_grid, mask = sa.swath_to_grid(swot_data.swaths_for_dates([T])[0], saf.lon, saf.lat)
+    obs_grid, mask = sa.swath_to_grid(swot_data.swaths_for_dates([T])[0], lib.lon, lib.lat)
     if mask.sum() < MIN_CELLS:
         continue
     gT, gV = field_on(T), field_on(vday)              # dense GLORYS @T and @T+14
-    gT_ds = saf.deseasonalize(saf.anom_of(gT), T)     # deseasonalized dense @T
-    gV_ds = saf.deseasonalize(saf.anom_of(gV), vday)  # deseasonalized dense truth @T+14
-    kw = dict(persist_surf=gT, k=K, min_sep=MIN_SEP)
+    gT_ds = lib.deseasonalize(lib.anom_of(gT), T)     # deseasonalized dense @T
+    gV_ds = lib.deseasonalize(lib.anom_of(gV), vday)  # deseasonalized dense truth @T+14
 
-    runs["metric-analog"].append(
-        sa.analog_vs_glorys(saf, obs_grid, mask, gV, vday, lead=LEAD, **kw))
-    runs["obs-oracle (mask)"].append(
-        sa.analog_vs_glorys(saf, gT, mask, gV, vday, lead=LEAD, **kw))
-    runs["present-oracle"].append(
-        sa.analog_vs_glorys(saf, gT, saf.ocean, gV, vday, lead=LEAD, **kw))
-    runs["present-oracle (ds)"].append(
-        sa.analog_vs_glorys(saf_ds, gT_ds, saf_ds.ocean, gV, vday, lead=LEAD, **kw))
+    # Each rung = same score, different selection target: select → forecast → evaluate.
+    def rung(sel_, obs_, mask_, L=LEAD):
+        selection = sel_.select(obs_, mask_, L, K, min_sep=MIN_SEP)
+        ens = forecaster.forecast(selection, L)
+        return sa.evaluate(lib, selection, ens, gV, vday, persist_surf=gT, lead=L)
+
+    runs["metric-analog"].append(rung(selector, obs_grid, mask))
+    runs["obs-oracle (mask)"].append(rung(selector, gT, mask))
+    runs["present-oracle"].append(rung(selector, gT, lib.ocean))
+    runs["present-oracle (ds)"].append(rung(selector_ds, gT_ds, lib_ds.ocean))
     runs["future-oracle"].append(          # best library mesoscale match to the truth, lead 0
-        sa.analog_vs_glorys(saf_ds, gV_ds, saf_ds.ocean, gV, vday, lead=0, **kw))
+        rung(selector_ds, gV_ds, lib_ds.ocean, L=0))
     obs_days.append(T)
 
 print(f"Used {len(obs_days)} obs days (K={K}, min_sep={MIN_SEP}, lead={LEAD}).\n")

@@ -14,7 +14,8 @@ import viz
 from distances import FrontMHDDistance
 from metrics import WeightedRMSE, AnomalyCorrelation, FrontMHDError
 from analog import (
-    ModelLibrary, AnalogForecaster, skill_curve, climatology_of, seasonal_climatology,
+    ModelLibrary, AnalogSelector, Forecast, skill_curve, climatology_of,
+    seasonal_climatology,
 )
 
 # %% ---- CONFIG ----------------------------------------------------------- #
@@ -64,10 +65,13 @@ metrics_list = [AnomalyCorrelation(lib.lat, clim), WeightedRMSE(lib.lat)]
 if FORECAST_VAR == OBS_VAR:                          # front MHD needs the SSH field
     ref_mean = float(np.nanmean(lib.mean_surf[lib.ocean]))
     metrics_list.append(FrontMHDError(lib.lon, lib.lat, lib.ocean, ref_mean))
+primary = metrics_list[0]
+# Decoupled: a selector (front-MHD) and a forecaster (ensemble mean of the analogs).
 # `source=path` keys the front-MHD matrix cache (built once inside prepare).
-af = AnalogForecaster(lib, DISTANCE, error_metrics=metrics_list, source=path)
+selector = AnalogSelector(lib, DISTANCE, source=path)
+forecaster = Forecast(lib)
 D, contours = DISTANCE.matrix, DISTANCE.fronts
-print(f"analog = {DISTANCE.name} | error = {af.primary_metric.name} | "
+print(f"analog = {DISTANCE.name} | error = {primary.name} | "
       f"forecast {FORECAST_VAR} {lib.state.shape[1:]}")
 
 # %% Dissimilarity visualisations.
@@ -78,21 +82,24 @@ viz.plot_front_pairs(D, contours, times, min_sep=MIN_SEP)
 
 # %% Forecast demo at one target / lead.
 da = ds[FORECAST_VAR]
-t0, lead = af.n // 2, 7
-viz.plot_forecast_demo(af, t0, lead, day, forecast_var=FORECAST_VAR,
-                       analog_name=DISTANCE.name,
+t0, lead = lib.n // 2, 7
+viz.plot_forecast_demo(selector, forecaster, lib, primary, t0, lead, day,
+                       forecast_var=FORECAST_VAR, analog_name=DISTANCE.name,
                        units=da.attrs.get("units", ""), plot_depth=PLOT_DEPTH,
                        k=K, exclude=EXCLUDE)
 # The analogs, their advanced futures, and the weighted average that combines them,
 # shown at two lead times (+7 and +14 days).
-viz.plot_analog_ensemble(af, t0, [lead, 14], day, k=K, exclude=EXCLUDE,
-                         units=da.attrs.get("units", ""), plot_depth=PLOT_DEPTH)
+viz.plot_analog_ensemble(selector, forecaster, lib, primary, t0, [lead, 14], day,
+                         k=K, exclude=EXCLUDE, units=da.attrs.get("units", ""),
+                         plot_depth=PLOT_DEPTH)
 
 # %% Forecast skill vs lead time (averaged over all valid targets), all metrics.
-_, skill_all = af.skill_self(LEADS, k=K, exclude=EXCLUDE, stride=SKILL_STRIDE)
-skill = skill_curve(af, LEADS, k=K, exclude=EXCLUDE)   # primary metric (ACC), for plot_skill
-viz.plot_skill(LEADS, skill, FORECAST_VAR, DISTANCE.name,
-               af.primary_metric.name, day[0][:4])
+_, skill_all = skill_curve(selector, forecaster, LEADS, metrics_list,
+                           k=K, exclude=EXCLUDE, stride=SKILL_STRIDE)
+_, skill_primary = skill_curve(selector, forecaster, LEADS, [primary],
+                               k=K, exclude=EXCLUDE)   # dense curve for plot_skill
+viz.plot_skill(LEADS, skill_primary[primary.name], FORECAST_VAR, DISTANCE.name,
+               primary.name, day[0][:4])
 for mname, base in skill_all.items():
     print(f"  {mname:22s} analog +{LEADS[-1]}d = {base['analog'][-1]:.3f} | "
           f"persistence = {base['persistence'][-1]:.3f}")

@@ -19,6 +19,8 @@ and is scored by the depth-aware metrics.
 import hashlib
 import os
 import warnings
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 import xarray as xr
@@ -157,8 +159,7 @@ class ModelLibrary:
 
         n_years = len(np.unique(self.times.astype("datetime64[Y]")))
         self.seasonal = (n_years >= 3) if seasonal is None else seasonal
-        self.clim_series = (seasonal_climatology(self.state, self.times)
-                            if self.seasonal else None)
+        self._clim_series = None                         # built lazily on first use
         self._static_clim = climatology_of(self.state)
 
     # -- anomaly / climatology helpers (surface) ----------------------------- #
@@ -179,11 +180,22 @@ class ModelLibrary:
         """Strip the day-of-year seasonal cycle from a surface *anomaly* field."""
         return field_anom - self.clim_anomaly(date64)
 
+    @property
+    def clim_series(self):
+        """Per-time seasonal climatology (time, *field), built on first use.
+
+        Deferred because it is a full-size array only some workflows need — the
+        SWOT→GLORYS scoring deseasonalizes via the on-the-fly ``clim_anomaly``
+        instead, so a 30-year library never pays for it.
+        """
+        if self.seasonal and self._clim_series is None:
+            self._clim_series = seasonal_climatology(self.state, self.times)
+        return self._clim_series
+
     def clim_forecast(self, t):
         """Climatology baseline field valid at library index `t` (seasonal if available)."""
-        if self.clim_series is not None:
-            return self.clim_series[t]
-        return self._static_clim
+        cs = self.clim_series
+        return cs[t] if cs is not None else self._static_clim
 
     def field_on(self, date64):
         """Nearest daily surface field to a calendar date, or None if out of range."""
@@ -194,51 +206,123 @@ class ModelLibrary:
 
 
 # --------------------------------------------------------------------------- #
-# The engine.
+# Selection result + forecast combiners — the seam between the two steps.
 # --------------------------------------------------------------------------- #
-class AnalogForecaster:
-    """Select library analogs of an observation and advance them into a forecast."""
+@dataclass
+class AnalogSet:
+    """The outcome of analog *selection*, independent of any forecast.
 
-    def __init__(self, library, distance, error_metrics=None, source=None,
-                 use_cache=True):
-        self.lib = library
-        self.distance = distance.prepare(library, source=source, use_cache=use_cache)
-        self.error_metrics = list(error_metrics) if error_metrics else []
-        # expose library attributes for plotting/back-compat (viz reads these).
-        for a in ("state", "n", "times", "lon", "lat", "anom", "ocean",
-                  "mean_surf", "wlat2d", "surf"):
-            setattr(self, a, getattr(library, a))
+    Holds the chosen library indices and their selection distances (smallest =
+    most similar, in the order returned by the selector). Turn it into a forecast
+    with a :class:`Combiner` (or ``Forecast.forecast``); the same
+    ``AnalogSet`` can be advanced to many lead times or scored on its own.
+    """
 
-    # -- library delegates --------------------------------------------------- #
-    def anom_of(self, field):
-        return self.lib.anom_of(field)
+    indices: np.ndarray
+    distances: np.ndarray
 
-    def clim_anomaly(self, date64):
-        return self.lib.clim_anomaly(date64)
-
-    def deseasonalize(self, field_anom, date64):
-        return self.lib.deseasonalize(field_anom, date64)
-
-    def clim_forecast(self, t):
-        return self.lib.clim_forecast(t)
-
-    def truth(self, t):
-        return self.state[t]
+    def __len__(self):
+        return len(self.indices)
 
     @property
-    def primary_metric(self):
-        return self.error_metrics[0] if self.error_metrics else None
+    def weights(self):
+        """Gaussian-on-distance ensemble weights, normalised to sum to 1."""
+        d = np.asarray(self.distances, dtype=float)
+        if d.size == 0:
+            return d
+        w = np.exp(-(d / d.mean()) ** 2)
+        return w / w.sum()
 
-    def error(self, forecast, truth, t=None, mask=None):
-        return self.primary_metric(forecast, truth, t=t, mask=mask)
 
-    # -- analog selection ---------------------------------------------------- #
-    def _select(self, d, k, min_sep):
-        """K nearest by `d`, optionally de-clustered to be ≥ min_sep indices apart."""
-        order = np.argsort(d)
-        if min_sep <= 0:
-            sel = order[:k]
-            return sel, d[sel]
+class Combiner(ABC):
+    """Turn a selection (:class:`AnalogSet`) into a forecast field at a given lead.
+
+    This is the *forecasting* step, fully decoupled from selection: it sees only
+    the chosen indices/weights and the state library, never the observation or the
+    distance. Swap it to change how analogs are combined without touching selection.
+    """
+
+    @abstractmethod
+    def __call__(self, analogs: AnalogSet, state, lead):
+        ...
+
+
+class EnsembleMean(Combiner):
+    """Gaussian-distance-weighted mean of the analogs advanced `lead` steps (default)."""
+
+    name = "ensemble-mean"
+
+    def __call__(self, analogs, state, lead):
+        return np.tensordot(analogs.weights, state[analogs.indices + lead], axes=1)
+
+
+class BestAnalog(Combiner):
+    """The single nearest analog advanced `lead` steps.
+
+    Preferred for sharp frontal targets (e.g. the Loop Current), where averaging
+    analogs displaces/blurs the front and the best single analog scores better."""
+
+    name = "best-analog"
+
+    def __call__(self, analogs, state, lead):
+        return state[analogs.indices[0] + lead]
+
+
+# --------------------------------------------------------------------------- #
+# Selection and forecasting — two decoupled classes.
+# --------------------------------------------------------------------------- #
+class AnalogSelector:
+    """Rank library analogs of an observation. Selection only — no forecasting.
+
+    Holds the model library and an ``ObsDistance``; :meth:`select` turns a gridded
+    observation into an :class:`AnalogSet` (indices + distances). Give a self-source
+    observation (``self_index`` set) an ``exclude`` window to block same-event
+    leakage; a cross-source observation (``self_index=None``) needs none.
+    """
+
+    def __init__(self, library, distance, source=None, use_cache=True):
+        self.lib = library
+        self.distance = distance.prepare(library, source=source, use_cache=use_cache)
+
+    def select(self, obs_grid, mask, lead=0, k=10, min_sep=0, exclude=0,
+               self_index=None):
+        """Return the K nearest analogs (with a valid `lead` future) as an AnalogSet.
+
+        `min_sep` de-clusters them to be ≥ that many days apart; `exclude` (self-
+        source only) drops candidates within that many days of `self_index`.
+        """
+        n = self.lib.n
+        d = self.distance.distance(obs_grid, mask, self_index=self_index)
+        a = np.arange(n)
+        invalid = a + lead >= n                              # need a `lead`-day future
+        if self_index is not None and exclude > 0:           # self-source leakage guard
+            invalid = invalid | (np.abs(a - self_index) <= exclude)
+        return _knearest(np.where(invalid, np.inf, d), k, min_sep)
+
+
+class Forecast:
+    """Turn a selection into a forecast field. Forecasting only — no selection.
+
+    Holds the model library and a default :class:`Combiner`; :meth:`forecast`
+    advances the selected analogs `lead` steps and combines them (``EnsembleMean``
+    by default, or pass ``combiner=BestAnalog()``). The same :class:`AnalogSet` can
+    be forecast at many leads.
+    """
+
+    def __init__(self, library, combiner=None):
+        self.lib = library
+        self.combiner = combiner or EnsembleMean()
+
+    def forecast(self, analogs, lead, combiner=None):
+        return (combiner or self.combiner)(analogs, self.lib.state, lead)
+
+
+def _knearest(d, k, min_sep):
+    """The K smallest distances as an AnalogSet; de-clustered ≥ min_sep apart."""
+    order = np.argsort(d)
+    if min_sep <= 0:
+        sel = order[:k]
+    else:
         kept = []
         for idx in order:
             if not np.isfinite(d[idx]):
@@ -247,104 +331,39 @@ class AnalogForecaster:
                 kept.append(int(idx))
                 if len(kept) == k:
                     break
-        sel = np.array(kept)
-        return sel, d[sel]
-
-    def n_candidates(self, t0, lead, exclude):
-        a = np.arange(self.n)
-        return int(np.sum((a + lead < self.n) & (np.abs(a - t0) > exclude)))
-
-    # self-mode: the observation IS the library surface state at index t0
-    def analogs(self, t0, lead, k, exclude=0, min_sep=0):
-        d = self.distance.distance(self.surf[t0], self.ocean, self_index=int(t0))
-        a = np.arange(self.n)
-        invalid = (a + lead >= self.n) | (np.abs(a - t0) <= exclude)
-        d = np.where(invalid, np.inf, d)
-        return self._select(d, k, min_sep)
-
-    def forecast(self, t0, lead, k=10, exclude=0, min_sep=0):
-        """Gaussian-weighted mean of the K nearest analogs advanced `lead` steps."""
-        sel, d_sel = self.analogs(t0, lead, k, exclude, min_sep)
-        w = np.exp(-(d_sel / d_sel.mean()) ** 2)
-        fc = np.tensordot(w, self.state[sel + lead], axes=1) / w.sum()
-        return fc, sel, d_sel
-
-    # obs-mode: an independent observation (a partial swath, an SST grid)
-    def analogs_obs(self, obs_grid, mask, lead, k, min_sep=0, self_index=None):
-        d = self.distance.distance(obs_grid, mask, self_index=self_index)
-        valid_future = np.arange(self.n) + lead < self.n
-        d = np.where(valid_future, d, np.inf)
-        return self._select(d, k, min_sep)
-
-    def forecast_obs(self, obs_grid, mask, lead, k=10, min_sep=0, self_index=None):
-        sel, d_sel = self.analogs_obs(obs_grid, mask, lead, k, min_sep, self_index)
-        w = np.exp(-(d_sel / d_sel.mean()) ** 2)
-        fc = np.tensordot(w, self.state[sel + lead], axes=1) / w.sum()
-        return fc, sel, d_sel
-
-    # -- observation-space scores (masked spatial pattern; see swot_analog) --- #
-    def score(self, field_anom, obs_grid, mask):
-        """Weighted spatial correlation of a field anomaly to an obs over `mask`
-        (verification twin of CorrelationDistance; higher = better, NaN if too few)."""
-        from swot_analog import _weighted_corr
-
-        valid = mask & np.isfinite(obs_grid) & self.ocean & np.isfinite(field_anom)
-        if valid.sum() < 10:
-            return np.nan
-        o = obs_grid[valid].astype(np.float32)
-        f = field_anom[valid].astype(np.float32)
-        w = self.wlat2d[valid].astype(np.float32)
-        return float(_weighted_corr(o, f[None, :], w)[0])
-
-    def score_rmse(self, field_anom, obs_grid, mask):
-        """Latitude-weighted RMSE vs an obs over `mask`, both de-meaned over the
-        observed cells first (removes the reference-offset difference)."""
-        valid = mask & np.isfinite(obs_grid) & self.ocean & np.isfinite(field_anom)
-        if valid.sum() < 10:
-            return np.nan
-        o = obs_grid[valid].astype(np.float32)
-        f = field_anom[valid].astype(np.float32)
-        w = self.wlat2d[valid].astype(np.float32)
-        W = w.sum()
-        o = o - (w * o).sum() / W
-        f = f - (w * f).sum() / W
-        return float(np.sqrt((w * (f - o) ** 2).sum() / W))
-
-    # -- multi-metric skill vs lead (self-source, dense truth) --------------- #
-    def skill_self(self, leads, k=10, exclude=30, min_sep=0, stride=1, metrics=None):
-        """Per-lead mean of every error metric for analog / persistence / climatology,
-        scored against the dense future library state. Reports all metrics together."""
-        metrics = metrics or self.error_metrics
-        names = ["analog", "persistence", "climatology"]
-        acc = {m.name: {nm: {L: [] for L in leads} for nm in names} for m in metrics}
-        for lead in leads:
-            for t0 in range(0, self.n, stride):
-                if t0 + lead >= self.n or self.n_candidates(t0, lead, exclude) < k:
-                    continue
-                V = t0 + lead
-                fc, _, _ = self.forecast(t0, lead, k=k, exclude=exclude, min_sep=min_sep)
-                truth = self.truth(V)
-                fields = {"analog": fc, "persistence": self.truth(t0),
-                          "climatology": self.clim_forecast(V)}
-                for m in metrics:
-                    for nm, fld in fields.items():
-                        acc[m.name][nm][lead].append(m(fld, truth, t=V, mask=self.ocean))
-        out = {m.name: {nm: np.array([np.nanmean(acc[m.name][nm][L])
-                                      if acc[m.name][nm][L] else np.nan
-                                      for L in leads]) for nm in names}
-               for m in metrics}
-        return list(leads), out
+        sel = np.array(kept, dtype=int)
+    return AnalogSet(sel, d[sel])
 
 
-def skill_curve(af, leads, k=10, exclude=5, stride=1):
-    """Back-compatible single-metric skill curve (primary error metric).
+def skill_curve(selector, forecaster, leads, metrics, k=10, exclude=30, min_sep=0,
+                stride=1):
+    """Per-lead mean of each metric for analog / persistence / climatology,
+    scored against the dense future library state (self-source).
 
-    Mean forecast error vs lead for the analog, persistence and climatology
-    forecasts, using the forecaster's primary error metric. Kept so existing
-    drivers / ``viz.plot_skill`` continue to work; prefer ``af.skill_self`` for the
-    full multi-metric report.
+    The observation is the library's own surface field at each target day (temporal
+    exclusion on); the forecast is the combiner's output. Returns
+    ``(leads, {metric_name: {analog|persistence|climatology: per-lead array}})``.
     """
-    m = af.primary_metric.name
-    _, out = af.skill_self(leads, k=k, exclude=exclude, stride=stride,
-                           metrics=[af.primary_metric])
-    return {nm: out[m][nm] for nm in ("analog", "persistence", "climatology")}
+    lib = selector.lib
+    n = lib.n
+    a = np.arange(n)
+    names = ["analog", "persistence", "climatology"]
+    acc = {m.name: {nm: {L: [] for L in leads} for nm in names} for m in metrics}
+    for lead in leads:
+        for t0 in range(0, n, stride):
+            if t0 + lead >= n or int(np.sum((a + lead < n) & (np.abs(a - t0) > exclude))) < k:
+                continue
+            sel = selector.select(lib.surf[t0], lib.ocean, lead, k, min_sep=min_sep,
+                                  exclude=exclude, self_index=t0)
+            V = t0 + lead
+            truth = lib.state[V]
+            fields = {"analog": forecaster.forecast(sel, lead),
+                      "persistence": lib.state[t0],
+                      "climatology": lib.clim_forecast(V)}
+            for m in metrics:
+                for nm, fld in fields.items():
+                    acc[m.name][nm][lead].append(m(fld, truth, t=V, mask=lib.ocean))
+    out = {m.name: {nm: np.array([np.nanmean(acc[m.name][nm][L]) if acc[m.name][nm][L]
+                                  else np.nan for L in leads]) for nm in names}
+           for m in metrics}
+    return list(leads), out
