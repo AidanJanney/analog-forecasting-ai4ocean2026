@@ -1,0 +1,78 @@
+# Configuration for analog_forecast.py.
+#
+# Paths are resolved relative to analog_forecast.py, so a config can live
+# anywhere and still point at the same data. Select a different one with:
+#
+#     python analog_forecast.py --config config/my_experiment.yaml
+
+data:
+  # Glob for the per-year Zarr stores written by ../subset_glorys.py.
+  zarr_glob: "../glorys_gom*_subset.zarr"
+  # Directory for output figures.
+  fig_dir: "figures_ssh_front_mhd"
+
+# Analysis domain, applied before any statistics, ranking, or plotting. Any bound
+# left null is not applied. The Loop Current sits in the eastern Gulf; the western
+# Gulf carries detached eddies with their own 17 cm contours, which dominate the
+# front match without saying anything about Loop Current position.
+domain:
+  min_longitude: -92.5
+  max_longitude: -80.0
+  min_latitude: null
+  max_latitude: null
+
+# Split the record into the analog library and the "observed" period we forecast for.
+periods:
+  library:
+    start: "1993-01-01"
+    end: "2022-06-30"
+  target:
+    start: "2023-01-01"
+    end: "2025-12-31"
+
+# Climatology the fields are standardized against before matching. As set here
+# the statistics are per calendar day and per grid point.
+climatology:
+  # "climday"        - day of year with Feb 29 folded into Feb 28 (equal sample
+  #                    counts in every group; see analog_forecast_notes.md)
+  # "time.dayofyear" - raw day of year; day 366 only sees the leap years
+  # "time.month"     - one mean/std per calendar month
+  group: climday
+  # Extra dims to average over when forming the statistics. Empty keeps them
+  # pointwise: one mean/std per group per grid cell. ["latitude", "longitude"]
+  # collapses to a single domain-wide statistic per group.
+  reduce_dims: []
+
+analogs:
+  # The day being forecast.
+  target_date: "2023-06-15"
+  # How library days are ranked against the target. One of:
+  #   sst_rmsd       - spatial RMSD of normalized SST anomalies
+  #   ssh_rmsd       - spatial RMSD of normalized SSH anomalies
+  #   ssh_front_mhd  - Modified Hausdorff Distance between Loop Current fronts
+  selection_metric: ssh_front_mhd
+  # Number of analogs to retain.
+  k: 10
+  # Minimum separation in days between retained analogs, so the top-K are not
+  # all consecutive days from one event.
+  buffer_days: 14
+  # SSH contour, in metres, that defines the Loop Current front. 0.17 is the
+  # standard 17 cm criterion (Leben 2005). Used by the MHD ranking only.
+  ssh_contour_level: 0.17
+
+forecast:
+  # How far the rollout runs, in days. Errors are evaluated every day out to
+  # here. Unrelated to analogs.buffer_days, which only spaces the analogs apart.
+  length_days: 30
+  # Lead times, in days, shown as map columns in the analog grids. Must all fall
+  # within length_days.
+  lead_days: [0, 10, 20, 30]
+  # Every forecast is scored by all of these, whichever metric selected the
+  # analogs. One of:
+  #   sst_rmse       - domain RMSE of SST, deg C
+  #   ssh_rmse       - domain RMSE of SSH, metres
+  #   sst_acc        - anomaly correlation of SST, higher is better
+  #   ssh_acc        - anomaly correlation of SSH, higher is better
+  #   ssh_front_mhd  - displacement between forecast and observed Loop Current
+  #                    front, grid cells
+  score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]

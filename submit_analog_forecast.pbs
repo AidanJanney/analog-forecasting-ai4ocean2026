@@ -1,0 +1,38 @@
+#!/bin/bash -l
+#PBS -N analog_forecast
+#PBS -A P93300012
+#PBS -q casper
+#PBS -l select=1:ncpus=8:mem=128GB
+#PBS -l walltime=01:00:00
+#PBS -j oe
+#PBS -o logs/
+
+# Run the analog forecast on Casper.
+#
+#     qsub submit_analog_forecast.pbs
+#     qsub -v CONFIG=config/smoke_test.yaml submit_analog_forecast.pbs
+#
+# Resources are deliberately generous: the full 33-year record holds three
+# float64 arrays of the whole period at once and peaks near 18 GB, so 128 GB
+# leaves room to widen the domain or add variables without revisiting this.
+# The extra cores help dask during the Zarr reads; the normalization and MHD
+# loops are single-threaded numpy and will not use them.
+
+conda activate /glade/work/ajanney/conda-envs/data-access-ai4ocean2026
+
+cd $PBS_O_WORKDIR
+
+# No display on a batch node.
+export MPLBACKEND=Agg
+
+# CONFIG=${CONFIG:-config/analog_forecast.yaml}
+CONFIG=${CONFIG:-config/select_ssh_front_mhd.yaml}
+
+echo "Host: $(hostname)"
+echo "Config: $CONFIG"
+echo "Started at $(date)"
+
+# PBS accounting often reports zero for a short job, so measure peak RSS here.
+python -u analog_forecast.py --config "$CONFIG"
+
+echo "Finished at $(date)"

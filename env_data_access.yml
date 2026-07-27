@@ -17,5 +17,6 @@ dependencies:
   - scipy
   - matplotlib
   - numpy
+  - pyyaml
   - requests
   - ipykernel

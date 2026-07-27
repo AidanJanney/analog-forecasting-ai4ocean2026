@@ -1,0 +1,40 @@
+# Fast configuration for checking the pipeline end to end: six years of data
+# instead of thirty-three, so a full pass takes about a minute.
+#
+#     python analog_forecast.py --config config/smoke_test.yaml
+#
+# Not for science. A six-year library is far too short for meaningful analogs.
+
+data:
+  zarr_glob: "../glorys_gom_199[3-8]_subset.zarr"
+  fig_dir: "figures_smoke_test"
+
+domain:
+  min_longitude: -92.5
+  max_longitude: -85.0
+  min_latitude: null
+  max_latitude: null
+
+periods:
+  library:
+    start: "1993-01-01"
+    end: "1997-12-31"
+  target:
+    start: "1998-01-01"
+    end: "1998-12-31"
+
+climatology:
+  group: climday
+  reduce_dims: []
+
+analogs:
+  target_date: "1998-06-15"
+  selection_metric: ssh_front_mhd
+  k: 5
+  buffer_days: 14
+  ssh_contour_level: 0.17
+
+forecast:
+  length_days: 30
+  lead_days: [0, 10, 20, 30]
+  score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
