@@ -37,7 +37,7 @@ def _strip_ticks(ax, keep_x, keep_y):
 
 def plot_analog_grid(var, library, rollout, skill, metrics, map_leads,
                      target_date, selection_metric, fig_dir, filename,
-                     contour_level=None, obs=None):
+                     contour_level=None, obs=None, max_rows=None):
     """One row per analog (state, then error), then the ensemble, then the truth.
 
     Columns are `map_leads`, optionally preceded by the observation that drove the
@@ -48,12 +48,19 @@ def plot_analog_grid(var, library, rollout, skill, metrics, map_leads,
     For a field with a `contour_level` the observed front is drawn on every panel
     and each member's own front dashed over it, so displacement reads directly off
     the panel instead of having to be inferred from the colour difference.
+
+    Only the `max_rows` best-ranked analogs get their own row — a selection of 20
+    would make an unreadable figure long before it ran out of distinguishable
+    colours. The ensemble row is still the full K-member ensemble, and its label
+    says so; capping is a display choice and never changes the forecast.
     """
     field = library.fields[var]
     analogs = rollout.analogs
-    n = len(analogs)
-    if n > len(ANALOG_COLORS):
-        raise ValueError(f"{n} analogs but only {len(ANALOG_COLORS)} categorical colours defined")
+    k = len(analogs)
+    n = min(k, max_rows or len(ANALOG_COLORS), len(ANALOG_COLORS))
+    if n < k:
+        print(f"  [{filename}] showing the top {n} of {k} analogs as rows; "
+              f"the ensemble row remains all {k}")
 
     truths = [rollout.truth[lead][var] for lead in map_leads]
     states = [[rollout.members[lead][i][var] for lead in map_leads] for i in range(n)]
@@ -62,8 +69,8 @@ def plot_analog_grid(var, library, rollout, skill, metrics, map_leads,
     errors = [[states[r][j] - truths[j] for j in range(len(map_leads))]
               for r in range(n + 1)]
 
-    row_labels = [f"Analog {i + 1}\n{d}" for i, d in enumerate(analogs.dates)]
-    row_labels += [f"Ensemble mean\nK = {n}", f"Observed\n{target_date}"]
+    row_labels = [f"Analog {i + 1}\n{d}" for i, d in enumerate(analogs.dates[:n])]
+    row_labels += [f"Ensemble mean\nK = {k}", f"Observed\n{target_date}"]
 
     state_min = min(float(f.min()) for row in states for f in row)
     state_max = max(float(f.max()) for row in states for f in row)

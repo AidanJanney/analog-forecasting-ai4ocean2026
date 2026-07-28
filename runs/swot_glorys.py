@@ -224,7 +224,7 @@ demo = fc.rollout(library, sel0, library.timestamp(end0), curve_leads,
 demo_skill = fc.score(demo, metrics)
 plots.plot_analog_grid("ssh", library, demo, demo_skill, metrics, map_leads, T0,
                        DISTANCE_NAME, FIG_DIR, "analog_grid.png",
-                       contour_level=LEVEL)
+                       contour_level=LEVEL, max_rows=K_SHOW)
 
 plots.plot_window_skill(labels, per_window, metrics, LEAD, FIG_DIR,
                         "swot_window_skill.png")

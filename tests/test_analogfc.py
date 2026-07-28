@@ -23,7 +23,8 @@ from analogfc.data.glorys import Field, FieldSet
 from analogfc.data.library import ModelLibrary
 from analogfc.data.regions import Region
 from analogfc.distance import DISTANCES, AnalogSelector, select_top_k
-from analogfc.forecast import COMBINERS, METRICS, rollout as fc, score as scoring
+from analogfc.forecast import (COMBINERS, METRICS, plots, rollout as fc,
+                               score as scoring)
 from analogfc.fronts import (FrontConvention, front_edt, front_mask,
                              front_mhd_km, grid_spacing_km)
 from analogfc.registry import Registry
@@ -838,6 +839,48 @@ def test_front_selection_is_degraded_by_the_western_ring():
     # Both must still be usable selections, not degenerate ones.
     for label, analogs in picked.items():
         assert len(analogs) == K and np.isfinite(analogs.distances).all(), label
+
+
+@case
+def test_analog_grid_caps_rows_instead_of_crashing():
+    """More analogs than categorical colours must degrade, not raise.
+
+    The SWOT run selects K=10 while only 7 colours are defined; this used to be a
+    ValueError at the very end of a long run, after all the science was done.
+    """
+    import tempfile
+
+    import matplotlib
+    matplotlib.use("Agg")
+
+    lib = synthetic_library()
+    target = lib.fields["ssh"].raw.sel(time=TARGET_DATE).time.values[0]
+    selector = AnalogSelector(lib, DISTANCES.create("ssh_rmsd"))
+    obs = lib.at("ssh", target, "standardized").values
+    analogs = selector.select(obs, k=10, buffer_days=10)
+    assert len(analogs) > len(plots.ANALOG_COLORS), "the test needs more analogs than colours"
+
+    metrics = scoring.build(["ssh_rmse"], lib, level=0.17)
+    result = fc.rollout(lib, analogs, target, [0, 5], variables=("ssh",))
+    skill = fc.score(result, metrics)
+
+    with tempfile.TemporaryDirectory() as out:
+        fig = plots.plot_analog_grid("ssh", lib, result, skill, metrics, [0, 5],
+                                     TARGET_DATE, "ssh_rmsd", out, "grid.png",
+                                     contour_level=0.17)
+        assert os.path.exists(os.path.join(out, "grid.png"))
+        # The ensemble label must still report the true K, not the row count.
+        labels = [t.get_text() for ax in fig.axes for t in [ax.yaxis.get_label()]]
+        assert any(f"K = {len(analogs)}" in t for t in labels), \
+            f"ensemble row must report all {len(analogs)} members"
+
+        # An explicit cap is honoured too.
+        plots.plot_analog_grid("ssh", lib, result, skill, metrics, [0, 5],
+                               TARGET_DATE, "ssh_rmsd", out, "grid3.png",
+                               contour_level=0.17, max_rows=3)
+        assert os.path.exists(os.path.join(out, "grid3.png"))
+    import matplotlib.pyplot as plt
+    plt.close("all")
 
 
 @case
