@@ -15,8 +15,8 @@ data:
   fig_dir: figures_swot_glorys
 
 domain:
-  min_longitude: -92.5
-  max_longitude: -80.0
+  min_longitude: null
+  max_longitude: null
   min_latitude: null
   max_latitude: null
 
@@ -53,6 +53,11 @@ analogs:
   buffer_days: 14
   ssh_contour_level: 0.17
   region: null
+  # region:
+  #   min_longitude: -92.5
+  #   max_longitude: -80.0
+  #   min_latitude: null
+  #   max_latitude: null
 
 forecast:
   leads: [0, 10, 20, 30]

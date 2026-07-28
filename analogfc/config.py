@@ -136,4 +136,12 @@ def validate(config, path=""):
             if key not in config["data"]:
                 raise ValueError(f"config{where}: run.source is 'swot' but "
                                  f"data.{key} is not set")
+    # The learned distance is the one selection rule that carries state on disk,
+    # so the run is only reproducible if the config names the weights it used.
+    if config["analogs"]["distance"] == "latent" \
+            and not config["analogs"].get("checkpoint"):
+        raise ValueError(f"config{where}: analogs.distance is 'latent' but "
+                         f"analogs.checkpoint is not set. Train one with\n"
+                         f"  python runs/train_metric.py "
+                         f"--config config/learn/metric_learning.yaml")
     return config

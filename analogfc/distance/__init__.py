@@ -8,7 +8,7 @@ Importing this package registers every built-in distance, so
 ``sst_rmsd``         RMSD of standardized SST anomalies
 ``ssh_front_mhd``    Loop Current front displacement, km
 ``correlation``      1 - pattern correlation over observed cells (cross-datum)
-``latent``           learned latent-space distance (stub)
+``latent``           1 - cosine in a learned embedding space (needs a checkpoint)
 ===================  ==========================================================
 
 To add one, drop a module here with an ``@DISTANCES.register("name")`` class and

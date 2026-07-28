@@ -209,7 +209,11 @@ class FrontConvention:
         if referenced:
             scored = ocean if region_mask is None else (ocean & region_mask)
             pool = library.pool(var or library.var).values
-            ref_mean = float(np.nanmean(np.nanmean(pool, axis=0)[scored]))
+            # Indexed by `scored` before nanmean, so the permanently-NaN land
+            # cells never enter the reduction — computing over the whole grid
+            # first and discarding land afterwards would still hit an all-NaN
+            # slice and warn.
+            ref_mean = float(np.nanmean(pool[:, scored]))
         return cls(library.sampling, level=level, ocean=ocean, ref_mean=ref_mean,
                    main_only=main_only, region_mask=region_mask)
 

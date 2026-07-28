@@ -28,7 +28,12 @@ import re
 
 import numpy as np
 
-import earthaccess
+# `earthaccess` is imported inside the three functions that need it, not here.
+# Only the *download* path uses it; once a period has been reduced to the per-day
+# point cache, every read function below works from disk alone (and the granules
+# themselves can be deleted). Keeping the import lazy means a machine that only
+# ever reads the cache — a training or forecast node — does not need Earthdata
+# tooling installed at all.
 
 # PO.DAAC SWOT Level-2 Low-Rate SSH collections. "Expert" carries the full set of
 # geophysical fields and corrections; "Basic" is a lighter subset. Which one you
@@ -70,6 +75,8 @@ def resolve_collection(name):
 
 def login(strategy="netrc", persist=True):
     """Authenticate with Earthdata (needed for downloads, not for search)."""
+    import earthaccess
+
     return earthaccess.login(strategy=strategy, persist=persist)
 
 
@@ -92,6 +99,8 @@ def search_swot(start, end, bbox=GOM_BBOX, short_name=DEFAULT_SHORT_NAME, count=
     list
         earthaccess granule results (pass to :func:`download`).
     """
+    import earthaccess
+
     return earthaccess.search_data(
         short_name=short_name,
         temporal=(start, end),
@@ -102,6 +111,8 @@ def search_swot(start, end, bbox=GOM_BBOX, short_name=DEFAULT_SHORT_NAME, count=
 
 def download(granules, out_dir="data/swot"):
     """Download granules to `out_dir` (requires an Earthdata login). Returns paths."""
+    import earthaccess
+
     os.makedirs(out_dir, exist_ok=True)
     return earthaccess.download(granules, local_path=out_dir)
 

@@ -91,6 +91,8 @@ truth = ModelLibrary(fields, period=TARGET_DATES, var="ssh")
 distance = DISTANCES.create(DISTANCE_NAME)
 if DISTANCE_NAME == "ssh_front_mhd":
     distance.level = SSH_CONTOUR_LEVEL
+if DISTANCE_NAME == "latent":
+    distance.checkpoint = cfg.resolve(config["analogs"]["checkpoint"])
 
 # The observation seam. `model` serves the library's own field in whatever
 # representation the distance asked for; `swot` bins real swaths onto the grid.
