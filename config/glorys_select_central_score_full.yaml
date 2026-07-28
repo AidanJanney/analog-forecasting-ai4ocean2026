@@ -1,28 +1,17 @@
-# GLORYS -> GLORYS, selecting on the central Gulf and scoring over the whole field.
+# GLORYS -> GLORYS, select on the central Gulf, score over the whole field.
 #
-#     python runs/glorys_analog.py --config config/glorys_select_central_score_full.yaml
+#     python runs/forecast.py --config config/glorys_select_central_score_full.yaml
 #
-# The question this config asks: if analogs are chosen purely on Loop Current
-# front position, how good is the resulting forecast *everywhere else*?
-#
-# The two earlier scenario configs cannot ask it, because they restrict the domain
-# at load time and so score over exactly the area they selected on. Here the
-# domain stays whole and the two stages take their own regions:
-#
-#     analogs.region    ->  92.5-80 W, where the front metric is meaningful
-#     forecast.region   ->  the whole basin, including the western Gulf that the
-#                           selection never looked at
-#
-# A selection that scores well only on its own region and badly outside it has
-# found a local match, not a circulation analogue.
+# One schema for every run; run.source picks where observations come from.
+# Paths resolve against the repository root, not this file or the cwd.
+
+run:
+  source: model
 
 data:
-  zarr_glob: "../glorys_gom*_subset.zarr"
-  fig_dir: "figures_select_central_score_full"
+  zarr_glob: "data/glorys/glorys_gom*_subset.zarr"
+  fig_dir: figures_select_central_score_full
 
-# Load everything. The regions below carve it up; `domain` only bounds what a
-# region may select from, and it is what governs memory (see
-# config/glorys_ssh_rmsd_full.yaml on budgeting the full field).
 domain:
   min_longitude: null
   max_longitude: null
@@ -41,15 +30,22 @@ climatology:
   group: climday
   reduce_dims: []
 
+observation:
+  dates: ["2023-06-15"]
+  n_days: 1
+  stride: 1
+  min_cells_per_day: 1
+  require_days: 1
+  weights: uniform
+  halflife: 3.0
+  max_swaths_per_day: null
+  front_cover_min: null
+
 analogs:
-  target_date: "2023-06-15"
-  selection_metric: ssh_front_mhd
+  distance: ssh_front_mhd
   k: 5
   buffer_days: 14
   ssh_contour_level: 0.17
-  # Rank library days on this area only. The western Gulf carries detached rings
-  # that cross the same 0.17 m level; over the whole basin they dominate the
-  # Hausdorff distance and the "front match" stops being about the Loop Current.
   region:
     min_longitude: -92.5
     max_longitude: -80.0
@@ -57,10 +53,14 @@ analogs:
     max_latitude: null
 
 forecast:
-  length_days: 30
-  lead_days: [0, 10, 20, 30]
+  leads: [0, 10, 20, 30]
+  headline_lead: 30
+  score_every_day_to: 30
   score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
   combiner: ensemble_mean
-  # Score over everything, including the area selection ignored. Omit this key,
-  # or leave it null, for "the whole domain".
   region: null
+
+figures:
+  diagnostics: true
+  k_show: 6
+  demo_day: null

@@ -17,7 +17,7 @@ import xarray as xr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analogfc import mhd
+from analogfc import config as cfg, mhd
 from analogfc.data import climatology, sources, windows as ow
 from analogfc.data.glorys import Field, FieldSet
 from analogfc.data.library import ModelLibrary
@@ -511,12 +511,12 @@ def test_scenario_configs_exist_and_match_the_tested_setup():
         with open(path) as fh:
             config = yaml.safe_load(fh)
 
-        assert config["analogs"]["selection_metric"] == metric_name, name
+        assert config["analogs"]["distance"] == metric_name, name
         assert config["domain"] == domain, f"{name}: domain drifted from {filename}"
         assert config["forecast"]["score_metrics"] == SCORE_METRICS, name
         assert config["analogs"]["k"] == K and config["analogs"]["buffer_days"] == BUFFER_DAYS
         # Every map lead must be reachable within the rollout.
-        assert max(config["forecast"]["lead_days"]) <= config["forecast"]["length_days"], name
+        assert max(config["forecast"]["leads"]) <= config["forecast"]["score_every_day_to"], name
         # The two scenarios must stay disjoint in library and target.
         assert config["periods"]["library"]["end"] < config["periods"]["target"]["start"], name
 
@@ -945,9 +945,7 @@ def test_every_config_names_registered_options():
             config = yaml.safe_load(fh)
         name = os.path.basename(path)
         analogs, forecast = config["analogs"], config["forecast"]
-        for key in ("selection_metric", "distance"):
-            if key in analogs:
-                assert analogs[key] in DISTANCES, f"{name}: {key}={analogs[key]!r}"
+        assert analogs["distance"] in DISTANCES, f"{name}: distance={analogs['distance']!r}"
         for metric in forecast.get("score_metrics", []):
             assert metric in METRICS, f"{name}: score metric {metric!r}"
         if "combiner" in forecast:
@@ -964,6 +962,88 @@ def test_every_config_names_registered_options():
             assert region.max_longitude is None or domain.max_longitude is None \
                 or region.max_longitude <= domain.max_longitude, \
                 f"{name}: {where}.region ends east of the loaded domain"
+
+
+@case
+def test_old_schema_keys_are_rejected_by_name():
+    """A config written against either old vocabulary must fail, not be ignored.
+
+    The two schemas gave three concepts two names each, and `lead_days` meant a
+    list of map columns in one and a single headline lead in the other. Silently
+    ignoring a key the loader no longer reads is the failure this prevents.
+    """
+    import copy
+
+    import yaml
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "config", "smoke_test.yaml")) as fh:
+        good = yaml.safe_load(fh)
+    cfg.validate(good)                       # the migrated config is fine
+
+    for section, key, expect in [
+            ("analogs", "selection_metric", "analogs.distance"),
+            ("analogs", "min_sep", "analogs.buffer_days"),
+            ("analogs", "target_date", "observation.dates"),
+            ("forecast", "length_days", "forecast.score_every_day_to"),
+            ("forecast", "curve_days", "forecast.score_every_day_to"),
+            ("forecast", "map_leads", "forecast.leads"),
+            ("forecast", "lead_days", "forecast.leads"),
+    ]:
+        stale = copy.deepcopy(good)
+        stale[section][key] = "whatever"
+        try:
+            cfg.validate(stale)
+        except ValueError as e:
+            assert f"{section}.{key}" in str(e), f"{section}.{key} not named in the error"
+            assert expect in str(e), f"the error must point at {expect}"
+        else:
+            raise AssertionError(f"{section}.{key} was accepted; it must be rejected")
+
+    # The whole [verification] section was split up.
+    stale = copy.deepcopy(good)
+    stale["verification"] = {"front_cover_min": 0.2}
+    try:
+        cfg.validate(stale)
+    except ValueError as e:
+        assert "verification" in str(e)
+    else:
+        raise AssertionError("a [verification] section must be rejected")
+
+    # An unknown section, and a missing required key.
+    for mutate, expect in [(lambda c: c.update(nonsense={}), "unknown section"),
+                           (lambda c: c["analogs"].pop("k"), "missing")]:
+        stale = copy.deepcopy(good)
+        mutate(stale)
+        try:
+            cfg.validate(stale)
+        except ValueError as e:
+            assert expect in str(e), f"{expect!r} not in {e}"
+        else:
+            raise AssertionError(f"expected a {expect} error")
+
+
+@case
+def test_leads_must_fit_inside_the_scoring_horizon():
+    import copy
+
+    import yaml
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "config", "smoke_test.yaml")) as fh:
+        good = yaml.safe_load(fh)
+
+    for mutate, expect in [
+            (lambda c: c["forecast"].update(leads=[0, 99]), "forecast.leads reaches 99"),
+            (lambda c: c["forecast"].update(headline_lead=99), "headline_lead is 99")]:
+        stale = copy.deepcopy(good)
+        mutate(stale)
+        try:
+            cfg.validate(stale)
+        except ValueError as e:
+            assert expect in str(e), f"{expect!r} not in {e}"
+        else:
+            raise AssertionError(f"expected {expect}")
 
 
 @case

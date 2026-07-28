@@ -70,8 +70,12 @@ def rollout(library, analogs, target_time, leads, variables=None,
     return Rollout(list(leads), truth, members, ensemble, valid_times, analogs)
 
 
-def report_skill(rollout, skill, metrics, selection_metric, k):
-    """Print the per-lead ensemble table and the best-member comparison."""
+def report_skill(rollout, skill, metrics, selection_metric, k, baseline=None):
+    """Print the per-lead ensemble table and the best-member comparison.
+
+    `baseline` is an optional ``{metric: per-lead curve}`` from
+    :func:`score_baseline` — the persistence comparison, reported last.
+    """
     print(f"\n--- Ensemble skill by lead (selection: {selection_metric}, K = {k}) ---")
     print("lead  " + "  ".join(f"{m.name:>16s}" for m in metrics))
     print("      " + "  ".join(f"{'(' + m.unit + ')':>16s}" for m in metrics))
@@ -89,6 +93,32 @@ def report_skill(rollout, skill, metrics, selection_metric, k):
         print(f"{metric.name:>16s}: ensemble {np.mean(ensemble_curve):.4f}  |  "
               f"best member {rollout.analogs.dates[best]} (rank {best + 1}) "
               f"{member_means[best]:.4f} {metric.unit}")
+
+    if baseline is None:
+        return
+    print("\n--- vs persistence (mean over the scored leads) ---")
+    for metric in metrics:
+        _, ensemble_curve = skill[metric.name]
+        ens, per = np.mean(ensemble_curve), np.nanmean(baseline[metric.name])
+        beats = (ens > per) if metric.higher_is_better else (ens < per)
+        print(f"{metric.name:>16s}: ensemble {ens:.4f}  |  persistence {per:.4f}  "
+              f"{metric.unit}  -> ensemble {'beats' if beats else 'loses to'} persistence")
+
+
+def persistence_fields(library, target_time, variables):
+    """The observed state at lead 0 — the persistence forecast for every lead.
+
+    The baseline any forecast has to beat: assume nothing changes. Over a
+    quiescent Loop Current period it is a strong one, which is exactly why it
+    belongs in every report rather than only in the runs where it loses.
+    """
+    return {v: library.at(v, target_time).compute() for v in variables}
+
+
+def score_baseline(rollout, metrics, fields):
+    """Score one fixed field set against the truth at every lead."""
+    return {m.name: [m(fields, rollout.truth[lead], rollout.valid_times[lead])
+                     for lead in rollout.leads] for m in metrics}
 
 
 def score(rollout, metrics):

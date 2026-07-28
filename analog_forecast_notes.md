@@ -46,6 +46,34 @@ The effect on the six-year smoke test is small and in the expected direction:
 | `ssh_rmsd` / `sst_rmsd` selection | same analogs, scores shifted in the 4th decimal; one `sst_rmsd` analog moved by a day (1995-09-23 → 1995-09-22) |
 | RMSE / ACC scores | ~0.5% |
 
+### 2026-07-28 — one driver, one config schema
+
+The two drivers were a symptom; the two config *schemas* were the disease. They
+shared 15 keys and diverged on 26, gave three concepts two names each
+(`selection_metric`/`distance`, `buffer_days`/`min_sep`, and `ssh_contour_level`
+in two different sections), and — worst — `forecast.lead_days` was a list of map
+columns in one schema and a single headline lead in the other. Same key, different
+type, no way to catch a mistake.
+
+That divergence had already caused a bug: a bulk edit adding `region:` to every
+config put it under `[climatology]` in the SWOT file, because that section sits
+between `[analogs]` and `[forecast]` there but not elsewhere. Nothing read it.
+
+Now one `runs/forecast.py` and one schema, with `run.source` choosing where
+observations come from. The unification is real rather than a dispatch: every run
+is windows x leads, and the old GLORYS workflow is `n_windows == 1` while the SWOT
+one is `n_leads == 1`. Old key names are rejected by name rather than ignored,
+since a silently-unread key is the failure that matters.
+
+Also restored in the merge: **persistence** is now reported for every run, not
+just the SWOT one. On the six-year smoke test the analog ensemble loses to
+persistence on 4 of 5 metrics — the same pattern the real SWOT run showed, and a
+useful reminder that the baseline is strong over short leads in quiet periods.
+
+Verified: the GLORYS run is bit-identical through the new driver on all three
+selection metrics, all 18 figures included, and the SWOT run reproduces its
+numbers exactly (0.145 / 0.522 / 29.517).
+
 ### 2026-07-28 — first real SWOT -> GLORYS run
 
 87 Expert-D granules for 2023-11-01..2023-12-15 (2.8 GB, reduced to 5.6 MB of

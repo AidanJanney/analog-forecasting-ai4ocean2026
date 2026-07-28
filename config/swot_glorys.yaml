@@ -1,135 +1,68 @@
-# Configuration for main_swot_glorys.py — SWOT-to-GLORYS analog forecasting.
+# SWOT -> GLORYS: real KaRIn swaths initialize the forecast.
 #
-# Distinct from config/analog_forecast.yaml, which configures the GLORYS-to-GLORYS
-# workflow in analog_forecast.py. Here the *observation* is a real SWOT swath and
-# the *library* is GLORYS, so the two are independent sources: no temporal
-# exclusion window is needed, because a 2023-2025 observation cannot leak into a
-# 1993-2022 analog pool.
+#     python runs/forecast.py --config config/swot_glorys.yaml
 #
-# Paths resolve relative to main_swot_glorys.py, not to this file or the working
-# directory. Select with:
-#
-#     python main_swot_glorys.py --config config/swot_glorys.yaml
+# One schema for every run; run.source picks where observations come from.
+# Paths resolve against the repository root, not this file or the cwd.
+
+run:
+  source: swot
 
 data:
-  # Per-year GLORYS Zarr stores written by ../subset_glorys.py.
-  zarr_glob: "../glorys_gom*_subset.zarr"
-  # Downloaded SWOT granules and their reduced per-day point cache
-  # (see: python swot_data.py fetch-range / cache).
+  zarr_glob: "data/glorys/glorys_gom*_subset.zarr"
   swot_dir: "data/swot"
   swot_points_dir: "data/swot_points"
-  fig_dir: "figures_swot_glorys"
+  fig_dir: figures_swot_glorys
 
-# Analysis domain, applied before any statistics, matching or plotting. Any bound
-# left null is not applied. The eastern-Gulf cut keeps the Loop Current and
-# excludes the western-Gulf detached eddies, whose own 0.17 m contours otherwise
-# dominate the front metrics without saying anything about Loop Current position.
 domain:
   min_longitude: -92.5
-  max_longitude: -85.0
+  max_longitude: -80.0
   min_latitude: null
   max_latitude: null
 
 periods:
-  # The analog pool. Ends before SWOT launches, so every analog is drawn from an
-  # era the observation cannot belong to.
   library:
     start: "1993-01-01"
     end: "2022-12-31"
-  # The SWOT era being forecast. SWOT KaRIn data does not exist before
-  # 2023-03-28, so the effective start is clipped to that (swot_data.SWOT_EPOCH).
   target:
     start: "2023-01-01"
     end: "2025-12-31"
 
-swot:
-  # Collection alias from swot_data.COLLECTIONS, or a raw CMR short name.
-  #   expert_d    2023-03-28 .. 2025-12-31  (covers the whole target period)
-  #   expert_2.0  2023-07-26 .. 2025-05-03  (validated science orbit only)
-  collection: expert_d
-  # Search/subset box for the granules; wider than `domain` so a swath clipped by
-  # the analysis box is still read from the file.
-  bbox: [-98.0, 18.0, -78.0, 32.0]
-
-# The observation window that initializes each forecast. This is the modular part:
-# a window spans `n_days` consecutive days and keeps up to `max_swaths_per_day`
-# passes on each, so `n_days: 1` + `max_swaths_per_day: 1` is a single swath on a
-# single day, and larger values composite more of the observing system.
-observation:
-  n_days: 3
-  # null keeps every co-located pass on a date; 1 uses only the best-covered one.
-  # Applied by sources.SwotSource, since "how many observations per day" is
-  # instrument policy — another source would cap something else, or nothing.
-  max_swaths_per_day: null
-  # A day contributing fewer observed grid cells than this is dropped from the
-  # window (a grazing pass that clips one corner of the box is not informative).
-  min_cells_per_day: 200
-  # Minimum usable days for a window to be forecast at all.
-  require_days: 1
-  # "uniform" weights every observed day alike; "recency" halves a day's weight
-  # every `halflife` days back, so the launch day dominates the match.
-  weights: uniform
-  halflife: 3.0
-  # Thin the candidate window end-dates (1 = every observed day).
-  stride: 1
-
-analogs:
-  # Number of analogs retained per window.
-  k: 10
-  # Minimum separation in days between retained analogs, so the top-K are not all
-  # consecutive days of one event.
-  min_sep: 14
-  # Observation-space distance used to rank the library. One of:
-  #   correlation - 1 - latitude-weighted spatial correlation over observed cells.
-  #                 The right choice for SWOT: it centres both fields over the
-  #                 swath, so SWOT `ssha` (referenced to a mean sea surface) and
-  #                 GLORYS `zos` (absolute) are comparable despite their different
-  #                 datums.
-  #   front_mhd   - Loop Current front displacement. Needs an *absolute* SSH field
-  #                 and so does NOT work on an anomaly-only SWOT swath; available
-  #                 for gridded absolute-SSH observations added later.
-  distance: correlation
-
-  # Area of the field used to RANK library days. Omit or null for the whole
-  # domain. Independent of forecast.region below, so a run can select on one
-  # area and verify on another.
-  region: null
-
-# Climatology the fields are standardized against, shared with the
-# GLORYS-to-GLORYS run. See config/analog_forecast.yaml for what the knobs do.
 climatology:
   group: climday
   reduce_dims: []
 
-forecast:
-  # Lead time in days at which the analogs are verified (the headline number).
-  lead_days: 14
-  # Leads shown as map columns in the analog grid figure. A lead with no dense
-  # GLORYS truth, or with no future for every selected analog, is dropped.
-  map_leads: [0, 7, 14]
-  # The analog grid's skill curves are evaluated every day out to here, so they
-  # are continuous even though the map columns stay at the coarser `map_leads`.
-  curve_days: 21
-  # Every window is scored by all of these; the last one is the headline metric
-  # in the per-window log. Same registry as the GLORYS-to-GLORYS run.
-  score_metrics: [ssh_rmse, ssh_acc, ssh_front_mhd]
-  # How the selected analogs become one forecast: ensemble_mean (plain mean),
-  # best_analog (the nearest one), or weighted_mean (Gaussian on distance).
-  combiner: ensemble_mean
+swot:
+  collection: expert_d
+  bbox: [-98.0, 18.0, -78.0, 32.0]
 
-  # Area of the field used to SCORE the forecast. Omit or null for the whole
-  # domain. Independent of analogs.region.
-  region: null
-verification:
-  # Minimum fraction of the Loop Current front the window must observe for the day
-  # to be scored. A ~120 km swath spans ~15-20% of the front, so 0.20 is about one
-  # clean crossing; multi-day windows clear it more often than single swaths.
-  front_cover_min: 0.20
-  # zos contour defining the Loop Current front, metres (Leben 2005).
+observation:
+  dates: null
+  n_days: 3
+  stride: 1
+  min_cells_per_day: 200
+  require_days: 1
+  weights: uniform
+  halflife: 3.0
+  max_swaths_per_day: null
+  front_cover_min: 0.2
+
+analogs:
+  distance: ssh_rmsd # distance: correlation
+  k: 10
+  buffer_days: 14
   ssh_contour_level: 0.17
+  region: null
+
+forecast:
+  leads: [0, 10, 20, 30]
+  headline_lead: 30
+  score_every_day_to: 30
+  score_metrics: [ssh_rmse, ssh_acc, ssh_front_mhd]
+  combiner: ensemble_mean
+  region: null
 
 figures:
-  # Analogs shown in the per-day illustration figures.
+  diagnostics: false
   k_show: 6
-  # Window end-date shown in the demo figures; null auto-picks the best-observed.
   demo_day: null

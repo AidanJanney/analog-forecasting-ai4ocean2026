@@ -10,12 +10,22 @@ distance  →  how library days are ranked against the observation
 forecast  →  how the analogs are combined, scored and drawn
 ```
 
-Two workflows differ only in which options they pick:
+**One driver, one config schema.** Every run is the same loop — take a set of
+observation windows, rank the library against each, roll the analogs forward,
+score them. The two workflows are two settings of that loop:
 
-| Workflow | Observation | Distance | Driver |
-|---|---|---|---|
-| **GLORYS → GLORYS** | a GLORYS state (full field) | `ssh_front_mhd`, `ssh_rmsd`, `sst_rmsd` | `runs/glorys_analog.py` |
-| **SWOT → GLORYS** | real SWOT KaRIn swaths (partial) | `correlation` | `runs/swot_glorys.py` |
+| Workflow | `run.source` | Observation | Distance | Shape |
+|---|---|---|---|---|
+| **GLORYS → GLORYS** | `model` | a GLORYS state (full field) | `ssh_front_mhd`, `ssh_rmsd`, `sst_rmsd` | 1 window × 31 leads |
+| **SWOT → GLORYS** | `swot` | real KaRIn swaths (partial) | `correlation` | N windows × 1 lead |
+
+```bash
+python runs/forecast.py --config config/analog_forecast.yaml
+```
+
+A single-day observation is a one-day window, and a one-day window's sequence
+distance reduces exactly to that day's distance, so the single-target case is not
+a special path — it is `n_windows == 1`.
 
 In both, the library and target periods are disjoint, so the target day cannot
 leak into its own analog pool and no exclusion window is needed. What genuinely
@@ -53,8 +63,7 @@ separate code path.
 | `forecast/rollout.py` | Advance a selection to every lead, in physical units. |
 | `forecast/score.py` | `METRICS`: `sst_rmse`, `ssh_rmse`, `sst_acc`, `ssh_acc`, `ssh_front_mhd`. |
 | `forecast/plots.py` | Analog grids, target-vs-best, per-window skill. |
-| `runs/glorys_analog.py` | GLORYS → GLORYS driver. Orchestration only. |
-| `runs/swot_glorys.py` | SWOT → GLORYS driver. |
+| `runs/forecast.py` | The driver. Orchestration only — every run goes through it. |
 | `tests/test_analogfc.py` | The suite. No data files, no pytest: `python tests/test_analogfc.py`. |
 | `config/*.yaml` | Run configurations. |
 | `submit_analog_forecast.pbs` | Casper PBS batch submission. |
@@ -152,11 +161,32 @@ cell size, which also corrects the grid's anisotropy (a degree of longitude at
 | `referenced` | Shift each field's ocean mean to a common datum before contouring, so the fixed level tracks the front's *position* rather than a basin-scale sea-level offset. Off within one reanalysis; on when comparing across datasets or eras. |
 | `main_only` | Keep only the largest connected segment — the Loop Current filament itself, not detached rings that also cross the level. Unstable where the domain's eastern cut clips the contour, so it is off by default. |
 
-### Selection and scoring regions
+### `domain` vs `region`
 
-`domain` bounds what is **loaded**. Within it, selection and scoring each take
-their own **region**, so a run can rank library days on one area and verify on
-another:
+Two different things, and the distinction matters:
+
+| | `domain` | `analogs.region` / `forecast.region` |
+|---|---|---|
+| when | once, at load | at compute time, per stage |
+| what it does | bounds the arrays read from disk | masks cells within what was loaded |
+| governs memory | **yes** — this is the memory knob | no |
+| how many per run | one | one per stage |
+| can differ between selection and scoring | no | **yes — that is the point** |
+
+`domain` is the outer bound: a region can only select from what the domain
+loaded, and a region falling outside it raises rather than returning an empty
+mask. Setting `domain` to a box is equivalent to loading everything and setting
+*both* regions to that box — verified bit-exact on real GLORYS — so use `domain`
+when every stage wants the same area (it is cheaper), and regions when they
+differ.
+
+One exception to that equivalence: with `climatology.reduce_dims: [latitude,
+longitude]` the standardization statistics become domain-wide rather than
+per-cell, so they depend on what was loaded. With the default `reduce_dims: []`
+the statistics are per grid cell and cropping cannot change them.
+
+Within the domain, selection and scoring each take their own region, so a run can
+rank library days on one area and verify on another:
 
 ```yaml
 domain:                      # what is loaded; regions are subsets of this
@@ -247,8 +277,8 @@ python download_glorys.py rechunk data/glorys_gom_1993.nc glorys_gom_1993_subset
 ## 3. Run a forecast
 
 ```bash
-python runs/glorys_analog.py                                 # config/analog_forecast.yaml
-python runs/glorys_analog.py --config config/smoke_test.yaml
+python runs/forecast.py                                      # config/analog_forecast.yaml
+python runs/forecast.py --config config/smoke_test.yaml
 ```
 
 ### Output
@@ -284,12 +314,15 @@ Paths are resolved relative to the repository root, not the config file.
 | `climatology.group` | Grouping for the normalization statistics. `climday` folds Feb 29 into Feb 28; `time.dayofyear` and `time.month` also accepted. |
 | `climatology.reduce_dims` | Extra dims to average over. Empty gives one mean and standard deviation per group per grid cell. |
 | `analogs.target_date` | Day being forecast. |
-| `analogs.selection_metric` | How library days are ranked. Any name in `DISTANCES`: `sst_rmsd`, `ssh_rmsd`, `ssh_front_mhd`. |
+| `run.source` | Where observations come from. Any name in `SOURCES`: `model`, `swot`. |
+| `observation.dates` | Days to forecast. A list for the single-target case; `null` for every usable observed day. |
+| `analogs.distance` | How library days are ranked. Any name in `DISTANCES`: `sst_rmsd`, `ssh_rmsd`, `ssh_front_mhd`, `correlation`. |
 | `analogs.k` | Number of analogs retained. |
 | `analogs.buffer_days` | Minimum separation between retained analogs. Nothing to do with forecast length. |
+| `forecast.leads` | Leads shown as map columns. |
+| `forecast.headline_lead` | The single lead the multi-window summary reports. |
+| `forecast.score_every_day_to` | Daily scoring horizon; `leads` and `headline_lead` must fit inside it. |
 | `analogs.ssh_contour_level` | SSH contour defining the Loop Current front, in metres. |
-| `forecast.length_days` | How far the rollout runs. Errors are evaluated every day out to here. |
-| `forecast.lead_days` | Leads shown as map columns in the analog grids. Must fall within `length_days`. |
 | `forecast.score_metrics` | Metrics every forecast is scored by. Any names in `METRICS`: `sst_rmse`, `ssh_rmse`, `sst_acc`, `ssh_acc`, `ssh_front_mhd`. ACC is a skill score, so higher is better; the rest are errors. |
 | `forecast.combiner` | How the analogs become one forecast. Any name in `COMBINERS`: `ensemble_mean` (plain mean), `best_analog`, `weighted_mean`. |
 
@@ -323,7 +356,7 @@ subset first.
 
    ```bash
    python tests/test_analogfc.py
-   python runs/glorys_analog.py --config config/my_metric.yaml
+   python runs/forecast.py --config config/my_metric.yaml
    ```
 
    The suite runs on synthetic data in about a second and needs no GLORYS files,
@@ -377,8 +410,8 @@ python -m analogfc.data.swot cache          # reduce granules already downloaded
 ### 6.2 Run
 
 ```bash
-python runs/swot_glorys.py                                 # config/swot_glorys.yaml
-python runs/swot_glorys.py --config config/my_swot.yaml
+python runs/forecast.py --config config/swot_glorys.yaml
+python runs/forecast.py --config config/my_swot.yaml
 ```
 
 ### 6.3 The observation window

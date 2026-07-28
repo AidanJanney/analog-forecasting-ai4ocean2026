@@ -1,13 +1,19 @@
-# Fast configuration for checking the pipeline end to end: six years of data
-# instead of thirty-three, so a full pass takes about a minute.
+# Six years instead of thirty-three, so a full pass takes about a minute.
 #
-#     python analog_forecast.py --config config/smoke_test.yaml
+# Not for science. A six-year library is far too short for meaningful analogs;
+# use it to check that code runs and figures render.
 #
-# Not for science. A six-year library is far too short for meaningful analogs.
+#     python runs/forecast.py --config config/smoke_test.yaml
+#
+# One schema for every run; run.source picks where observations come from.
+# Paths resolve against the repository root, not this file or the cwd.
+
+run:
+  source: model
 
 data:
-  zarr_glob: "../glorys_gom_199[3-8]_subset.zarr"
-  fig_dir: "figures_smoke_test"
+  zarr_glob: "data/glorys/glorys_gom_199[3-8]_subset.zarr"
+  fig_dir: figures_smoke_test
 
 domain:
   min_longitude: -92.5
@@ -27,26 +33,33 @@ climatology:
   group: climday
   reduce_dims: []
 
+observation:
+  dates: ["1998-06-15"]
+  n_days: 1
+  stride: 1
+  min_cells_per_day: 1
+  require_days: 1
+  weights: uniform
+  halflife: 3.0
+  max_swaths_per_day: null
+  front_cover_min: null
+
 analogs:
-  target_date: "1998-06-15"
-  selection_metric: ssh_front_mhd
+  distance: ssh_front_mhd
   k: 5
   buffer_days: 14
   ssh_contour_level: 0.17
-
-  # Area of the field used to RANK library days. Omit or null for the whole
-  # domain. Independent of forecast.region below, so a run can select on one
-  # area and verify on another.
   region: null
+
 forecast:
-  length_days: 30
-  lead_days: [0, 10, 20, 30]
+  leads: [0, 10, 20, 30]
+  headline_lead: 30
+  score_every_day_to: 30
   score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
-  # How the selected analogs become one forecast: ensemble_mean (plain
-  # mean), best_analog (the nearest one), or weighted_mean (Gaussian on
-  # distance).
   combiner: ensemble_mean
-
-  # Area of the field used to SCORE the forecast. Omit or null for the whole
-  # domain. Independent of analogs.region.
   region: null
+
+figures:
+  diagnostics: true
+  k_show: 6
+  demo_day: null
