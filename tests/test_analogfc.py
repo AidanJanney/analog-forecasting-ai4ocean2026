@@ -35,26 +35,41 @@ def case(fn):
 
 
 # --------------------------------------------------------------------------- #
-# A small synthetic record: a blob of high SSH drifting north, so the front moves
-# and analogs have something real to match on. Six years, because the climatology
-# is per calendar day — a shorter record leaves each day-of-year group with one
-# sample, a zero standard deviation, and a standardization that divides by it.
+# A synthetic Gulf, on the real grid extent (18-32 N, 98-78 W).
+#
+# Two features, matching the two things the real domain choices are about:
+#
+#   * a Loop Current analogue in the central Gulf near 88.5 W, drifting north and
+#     back on a 60-day cycle, so the front moves and analogs have something real
+#     to match on;
+#   * a detached ring in the western Gulf near 95 W, on a slower, unrelated cycle.
+#     It crosses the same 0.17 m level, so a front metric run over the whole basin
+#     will chase it. That is exactly why the front scenario cuts at 92.5 W.
+#
+# Six years, because the climatology is per calendar day: a shorter record leaves
+# each day-of-year group with one sample, a zero standard deviation, and a
+# standardization that divides by it.
 # --------------------------------------------------------------------------- #
-def synthetic_fields(n_time=6 * 365, nlat=24, nlon=30, seed=0):
+LIBRARY_PERIOD = slice("1993-01-01", "1997-12-31")
+
+
+def _build_fields(n_time, nlat, nlon, seed):
     rng = np.random.default_rng(seed)
-    lat = np.linspace(20.0, 28.0, nlat)
-    lon = np.linspace(-92.0, -85.0, nlon)
+    lat = np.linspace(18.0, 32.0, nlat)
+    lon = np.linspace(-98.0, -78.0, nlon)
     time = pd.date_range("1993-01-01T12:00", periods=n_time, freq="D")
 
     yy, xx = np.meshgrid(lat, lon, indexing="ij")
     ssh = np.empty((n_time, nlat, nlon))
     sst = np.empty((n_time, nlat, nlon))
     for t in range(n_time):
-        centre = 23.0 + 1.5 * np.sin(2 * np.pi * t / 60.0)          # blob drifts
-        blob = 0.45 * np.exp(-(((yy - centre) / 1.2) ** 2 + ((xx + 88.5) / 1.6) ** 2))
+        centre = 24.0 + 1.5 * np.sin(2 * np.pi * t / 60.0)
+        loop = 0.45 * np.exp(-(((yy - centre) / 1.4) ** 2 + ((xx + 88.5) / 1.8) ** 2))
+        ring_lat = 23.5 + 2.0 * np.sin(2 * np.pi * t / 217.0)     # unrelated drift
+        ring = 0.40 * np.exp(-(((yy - ring_lat) / 1.2) ** 2 + ((xx + 95.0) / 1.5) ** 2))
         seasonal = 0.05 * np.sin(2 * np.pi * t / 365.25)
-        ssh[t] = blob + seasonal + 0.01 * rng.standard_normal((nlat, nlon))
-        sst[t] = 25.0 + 6.0 * np.sin(2 * np.pi * t / 365.25) + 8 * blob \
+        ssh[t] = loop + ring + seasonal + 0.01 * rng.standard_normal((nlat, nlon))
+        sst[t] = 25.0 + 6.0 * np.sin(2 * np.pi * t / 365.25) + 8 * loop \
             + 0.05 * rng.standard_normal((nlat, nlon))
     ssh[:, 0, 0] = np.nan                                            # a land cell
     sst[:, 0, 0] = np.nan
@@ -73,9 +88,36 @@ def synthetic_fields(n_time=6 * 365, nlat=24, nlon=30, seed=0):
                      "ssh": make("ssh", ssh, "m", "RdBu_r", True)})
 
 
-def synthetic_library(**kw):
+_FIELD_CACHE = {}
+
+
+def synthetic_fields(n_time=6 * 365, nlat=29, nlon=41, seed=0):
+    """The full synthetic record, built once and shared (nothing mutates it)."""
+    key = (n_time, nlat, nlon, seed)
+    if key not in _FIELD_CACHE:
+        _FIELD_CACHE[key] = _build_fields(*key)
+    return _FIELD_CACHE[key]
+
+
+def in_domain(fields, min_longitude=None, max_longitude=None,
+              min_latitude=None, max_latitude=None):
+    """A domain subset of a FieldSet — what open_glorys' `.sel` does to the store."""
+    lon_slice = slice(min_longitude, max_longitude)
+    lat_slice = slice(min_latitude, max_latitude)
+    subset = {}
+    for name, f in fields.items():
+        subset[name] = Field(name=name,
+                             raw=f.raw.sel(longitude=lon_slice, latitude=lat_slice),
+                             unit=f.unit, cmap=f.cmap, symmetric=f.symmetric,
+                             group=f.group)
+    return FieldSet(subset)
+
+
+def synthetic_library(domain=None, **kw):
     fields = synthetic_fields(**kw)
-    return ModelLibrary(fields, period=slice("1993-01-01", "1997-12-31"), var="ssh")
+    if domain:
+        fields = in_domain(fields, **domain)
+    return ModelLibrary(fields, period=LIBRARY_PERIOD, var="ssh")
 
 
 # --------------------------------------------------------------------------- #
@@ -409,6 +451,235 @@ def test_ensemble_may_be_combined_in_either_space():
     meaned_then_mapped = field.to_physical(sum(anomalies) / 4, when)
     assert np.allclose(mapped_then_meaned.values, meaned_then_mapped.values,
                        equal_nan=True)
+
+
+# --------------------------------------------------------------------------- #
+# The two GLORYS -> GLORYS scenarios, mirroring their config files. Each runs the
+# whole pipeline — data -> distance -> forecast -> score — on the synthetic record
+# with that scenario's domain and selection rule.
+# --------------------------------------------------------------------------- #
+FULL_DOMAIN = dict(min_longitude=None, max_longitude=None,
+                   min_latitude=None, max_latitude=None)
+CENTRAL_DOMAIN = dict(min_longitude=-92.5, max_longitude=-80.0,
+                      min_latitude=None, max_latitude=None)
+
+SCENARIOS = {
+    # name: (config file, domain, selection metric)
+    "ssh_rmsd_full": ("glorys_ssh_rmsd_full.yaml", FULL_DOMAIN, "ssh_rmsd"),
+    "ssh_front_mhd_central": ("glorys_ssh_front_mhd_central.yaml", CENTRAL_DOMAIN,
+                              "ssh_front_mhd"),
+}
+
+SCORE_METRICS = ["sst_rmse", "ssh_rmse", "sst_acc", "ssh_acc", "ssh_front_mhd"]
+TARGET_DATE = "1998-06-15"
+LEADS = [0, 10, 20, 30]
+K, BUFFER_DAYS = 5, 14
+
+
+def run_scenario(name, leads=LEADS, k=K, buffer_days=BUFFER_DAYS):
+    """The scenario end to end, returning everything the assertions need."""
+    _, domain, metric_name = SCENARIOS[name]
+    lib = synthetic_library(domain=domain)
+
+    distance = DISTANCES.create(metric_name)
+    if metric_name == "ssh_front_mhd":
+        distance.level = 0.17
+    selector = AnalogSelector(lib, distance)
+
+    # The target is outside the library period, as in the real configs.
+    target = lib.fields["ssh"].raw.sel(time=TARGET_DATE).time.values[0]
+    observation = lib.at(distance.var, target, distance.representation).values
+    analogs = selector.select(observation, k=k, buffer_days=buffer_days)
+
+    metrics = scoring.build(SCORE_METRICS, lib, level=0.17)
+    result = fc.rollout(lib, analogs, target, leads)
+    return lib, analogs, result, fc.score(result, metrics), metrics
+
+
+@case
+def test_scenario_configs_exist_and_match_the_tested_setup():
+    """The configs and these tests must not drift apart."""
+    import yaml
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name, (filename, domain, metric_name) in SCENARIOS.items():
+        path = os.path.join(root, "config", filename)
+        assert os.path.exists(path), f"{name}: missing config {filename}"
+        with open(path) as fh:
+            config = yaml.safe_load(fh)
+
+        assert config["analogs"]["selection_metric"] == metric_name, name
+        assert config["domain"] == domain, f"{name}: domain drifted from {filename}"
+        assert config["forecast"]["score_metrics"] == SCORE_METRICS, name
+        assert config["analogs"]["k"] == K and config["analogs"]["buffer_days"] == BUFFER_DAYS
+        # Every map lead must be reachable within the rollout.
+        assert max(config["forecast"]["lead_days"]) <= config["forecast"]["length_days"], name
+        # The two scenarios must stay disjoint in library and target.
+        assert config["periods"]["library"]["end"] < config["periods"]["target"]["start"], name
+
+
+@case
+def test_scenario_domains_differ_as_intended():
+    """The full domain spans the basin; the central one drops the western Gulf."""
+    full = synthetic_library(domain=FULL_DOMAIN)
+    central = synthetic_library(domain=CENTRAL_DOMAIN)
+
+    assert float(full.longitude.min()) == -98.0
+    assert float(central.longitude.min()) >= -92.5
+    assert float(central.longitude.max()) <= -80.0
+    assert central.longitude.size < full.longitude.size
+    assert central.latitude.size == full.latitude.size      # no latitude bound
+
+    # The point of the cut: the western ring crosses the same level, so over the
+    # full basin it appears in the front mask and competes with the Loop Current.
+    when = full.times[300]
+    full_front = front_mask(full.at("ssh", when).values, level=0.17)
+    west = full.longitude.values < -92.5
+    assert full_front[:, west].any(), "the decoy ring should show up over the full basin"
+
+    central_front = front_mask(central.at("ssh", when).values, level=0.17)
+    assert central_front.any(), "the Loop Current front should survive the cut"
+    assert central_front.shape[1] == central.longitude.size
+
+
+@case
+def test_rollout_ssh_rmsd_full():
+    """Scenario 1: RMSD selection over the whole field."""
+    check_scenario_rollout("ssh_rmsd_full")
+
+
+@case
+def test_rollout_ssh_front_mhd_central():
+    """Scenario 2: front MHD selection over the central Gulf."""
+    check_scenario_rollout("ssh_front_mhd_central")
+
+
+def check_scenario_rollout(name):
+    lib, analogs, result, skill, metrics = run_scenario(name)
+    _, _, metric_name = SCENARIOS[name]
+
+    # -- selection ------------------------------------------------------------ #
+    assert len(analogs) == K, f"{name}: got {len(analogs)} analogs, wanted {K}"
+    assert analogs.metric == metric_name
+    assert np.isfinite(analogs.distances).all(), f"{name}: an unscorable day was selected"
+    assert (np.diff(analogs.distances) >= 0).all(), f"{name}: analogs not in rank order"
+    gaps = np.abs(np.diff(np.sort(analogs.times)).astype("timedelta64[D]").astype(int))
+    assert (gaps >= BUFFER_DAYS).all(), f"{name}: buffer violated, gaps {gaps}"
+    # Every analog must come from the library period, never the target period.
+    assert all(np.datetime64("1993-01-01") <= t <= np.datetime64("1997-12-31")
+               for t in analogs.times), f"{name}: an analog leaked from outside the library"
+
+    # -- rollout -------------------------------------------------------------- #
+    assert result.leads == LEADS
+    for lead in LEADS:
+        assert result.valid_times[lead] == pd.Timestamp(TARGET_DATE + "T12:00") \
+            + pd.Timedelta(days=lead)
+        assert len(result.members[lead]) == K
+        for var in ("sst", "ssh"):
+            field = lib.fields[var]
+            truth = result.truth[lead][var]
+            ens = result.ensemble[lead][var]
+            assert ens.shape == truth.shape, f"{name}: {var} shape drifted at lead {lead}"
+
+            # Forecasts must come back in physical units, not in sigma. The
+            # rollout maps each member through the climatology of the day being
+            # forecast, so the ensemble's domain mean must sit within a few
+            # climatological standard deviations of that day's climatology — a
+            # forecast left in anomaly space would have a domain mean near zero
+            # and miss by the whole field magnitude.
+            clim = field.climatology_at(result.valid_times[lead])
+            tolerance = 3 * float(field.clim_std.mean())
+            offset = abs(float(ens.mean()) - float(clim.mean()))
+            assert offset < tolerance, (
+                f"{name}: {var} ensemble at lead {lead} is {offset:.3f} from the "
+                f"climatology (tolerance {tolerance:.3f}) — not in physical units")
+
+            # The ensemble is the plain mean of its members.
+            stack = np.stack([result.members[lead][i][var].values for i in range(K)])
+            assert np.allclose(ens.values, stack.mean(axis=0), equal_nan=True)
+
+    # -- scoring -------------------------------------------------------------- #
+    for metric in metrics:
+        per_member, ensemble_curve = skill[metric.name]
+        assert len(per_member) == K and len(ensemble_curve) == len(LEADS)
+        assert np.isfinite(ensemble_curve).all(), \
+            f"{name}: {metric.name} produced a non-finite ensemble score"
+        assert np.isfinite(np.asarray(per_member)).all(), \
+            f"{name}: {metric.name} produced a non-finite member score"
+
+    # A correlation must stay a correlation, and a distance in km must be a
+    # plausible number of km rather than a count of grid cells.
+    for acc in ("sst_acc", "ssh_acc"):
+        assert (np.abs(skill[acc][1]) <= 1.0 + 1e-9).all(), f"{name}: {acc} out of range"
+    mhd = np.asarray(skill["ssh_front_mhd"][1])
+    assert (mhd >= 0).all() and (mhd < 3000).all(), f"{name}: front MHD implausible: {mhd}"
+    assert (np.asarray(skill["ssh_rmse"][1]) >= 0).all()
+
+
+@case
+def test_front_score_is_in_km_on_the_library_grid():
+    """The scored front distance must use the library's physical cell size.
+
+    The range check in the rollout tests is too loose to notice a score reported
+    in grid cells, so pin it directly: a front displaced by exactly one cell must
+    score as one latitude cell in km, for both scenario domains.
+    """
+    for name, (_, domain, _) in SCENARIOS.items():
+        lib = synthetic_library(domain=domain)
+        metric = scoring.build(["ssh_front_mhd"], lib, level=0.17)[0]
+        assert metric.sampling == lib.sampling, f"{name}: metric is not on the library grid"
+
+        dlat_km = lib.sampling[0]
+        assert dlat_km > 10, f"{name}: cell size {dlat_km} looks like cells, not km"
+
+        template = lib.at("ssh", lib.times[0])
+        truth = template.copy(deep=True)
+        truth.values[:] = 0.05
+        truth.values[10:, :] = 0.30            # a front along one latitude row
+        shifted = truth.copy(deep=True)
+        shifted.values[:] = 0.05
+        shifted.values[11:, :] = 0.30          # the same front, one cell north
+
+        d = metric({"ssh": shifted}, {"ssh": truth})
+        assert abs(d - dlat_km) < 1e-6, f"{name}: one-cell shift scored {d}, not {dlat_km}"
+
+
+@case
+def test_selection_rules_disagree_about_which_days_are_analogs():
+    """The two scenarios must actually be different experiments.
+
+    If a field-wide RMSD and a front-geometry distance picked the same days there
+    would be no reason to keep both, and the comparison the configs set up would
+    be vacuous.
+    """
+    _, rmsd_analogs, _, _, _ = run_scenario("ssh_rmsd_full", leads=[0])
+    _, mhd_analogs, _, _, _ = run_scenario("ssh_front_mhd_central", leads=[0])
+    assert set(rmsd_analogs.dates) != set(mhd_analogs.dates)
+
+
+@case
+def test_front_selection_is_degraded_by_the_western_ring():
+    """Why the front scenario restricts the domain.
+
+    Ranked over the whole basin the front distance is contaminated by the western
+    ring, which crosses the same level on its own unrelated cycle. Restricting to
+    the central Gulf must change which days it calls analogs.
+    """
+    target = synthetic_fields()["ssh"].raw.sel(time=TARGET_DATE).time.values[0]
+
+    picked = {}
+    for label, domain in [("full", FULL_DOMAIN), ("central", CENTRAL_DOMAIN)]:
+        lib = synthetic_library(domain=domain)
+        distance = DISTANCES.create("ssh_front_mhd")
+        selector = AnalogSelector(lib, distance)
+        obs = lib.at("ssh", target, "raw").values
+        picked[label] = selector.select(obs, k=K, buffer_days=BUFFER_DAYS)
+
+    assert set(picked["full"].dates) != set(picked["central"].dates), \
+        "the western ring made no difference; the synthetic decoy is too weak"
+    # Both must still be usable selections, not degenerate ones.
+    for label, analogs in picked.items():
+        assert len(analogs) == K and np.isfinite(analogs.distances).all(), label
 
 
 @case

@@ -1,0 +1,56 @@
+# GLORYS -> GLORYS, SSH RMSD selection over the whole field.
+#
+#     python runs/glorys_analog.py --config config/glorys_ssh_rmsd_full.yaml
+#
+# The matched pair to config/glorys_ssh_front_mhd_central.yaml: same target, same
+# library, same scoring, differing only in the selection rule and the domain each
+# one needs. RMSD is a field-wide statistic, so it wants the whole basin — every
+# grid cell is evidence about the circulation state, and restricting the box
+# throws that evidence away. The front metric wants the opposite; see that file.
+
+data:
+  zarr_glob: "../glorys_gom*_subset.zarr"
+  fig_dir: "figures_ssh_rmsd_full"
+
+# No bounds applied: the full 169 x 241 subset, 18-32 N, 98-78 W.
+#
+# Memory. This is the largest domain the pipeline runs on — roughly 4 GB per
+# full-record array, and the run holds the raw and standardized SSH and SST at
+# once. Budget ~32 GB and use the batch script rather than a default interactive
+# session, which caps at 10 GB:
+#
+#     qsub -v CONFIG=config/glorys_ssh_rmsd_full.yaml submit_analog_forecast.pbs
+domain:
+  min_longitude: null
+  max_longitude: null
+  min_latitude: null
+  max_latitude: null
+
+periods:
+  library:
+    start: "1993-01-01"
+    end: "2022-06-30"
+  target:
+    start: "2023-01-01"
+    end: "2025-12-31"
+
+climatology:
+  group: climday
+  reduce_dims: []
+
+analogs:
+  target_date: "2023-06-15"
+  # Latitude-weighted spatial RMSD of standardized SSH anomalies. Every cell in
+  # the domain contributes, which is why this one takes the whole field.
+  selection_metric: ssh_rmsd
+  k: 5
+  buffer_days: 14
+  # Unused by this selection metric, but the front is still *scored* below, so
+  # the level has to be defined.
+  ssh_contour_level: 0.17
+
+forecast:
+  length_days: 30
+  lead_days: [0, 10, 20, 30]
+  score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
+  combiner: ensemble_mean

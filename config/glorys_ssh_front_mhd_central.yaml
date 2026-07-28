@@ -1,0 +1,59 @@
+# GLORYS -> GLORYS, Loop Current front MHD selection over the central Gulf.
+#
+#     python runs/glorys_analog.py --config config/glorys_ssh_front_mhd_central.yaml
+#
+# The matched pair to config/glorys_ssh_rmsd_full.yaml: same target, same library,
+# same scoring, differing only in the selection rule and the domain each one needs.
+
+data:
+  zarr_glob: "../glorys_gom*_subset.zarr"
+  fig_dir: "figures_ssh_front_mhd_central"
+
+# 92.5 W to 80 W — the central Gulf, 169 x 151 of the full 169 x 241.
+#
+# The restriction is not a performance choice, it is what makes the metric mean
+# what it says. The front is the 0.17 m contour, and the western Gulf carries
+# detached Loop Current rings that cross that level with their own closed
+# contours. Those rings are large and they move, so over the full basin they
+# dominate the Hausdorff distance and the "front match" ends up ranking library
+# days by where last year's shed eddy drifted to, saying nothing about the Loop
+# Current's own position. Cutting at 92.5 W drops them.
+#
+# The eastern cut at 80 W matters too, though less: further east the contour runs
+# into the domain boundary and gets clipped into a long boundary-hugging segment
+# that competes with the Loop Current itself.
+domain:
+  min_longitude: -92.5
+  max_longitude: -80.0
+  min_latitude: null
+  max_latitude: null
+
+periods:
+  library:
+    start: "1993-01-01"
+    end: "2022-06-30"
+  target:
+    start: "2023-01-01"
+    end: "2025-12-31"
+
+climatology:
+  group: climday
+  reduce_dims: []
+
+analogs:
+  target_date: "2023-06-15"
+  # Modified Hausdorff distance between Loop Current fronts, in km. Runs on the
+  # raw field: the front is a property of physical SSH, and the standardized
+  # anomaly has exactly the mean structure that defines it removed.
+  selection_metric: ssh_front_mhd
+  k: 5
+  buffer_days: 14
+  # The contour defining the front, metres. The 17 cm criterion (Leben 2005).
+  # Used by this selection metric and by the ssh_front_mhd score.
+  ssh_contour_level: 0.17
+
+forecast:
+  length_days: 30
+  lead_days: [0, 10, 20, 30]
+  score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
+  combiner: ensemble_mean
