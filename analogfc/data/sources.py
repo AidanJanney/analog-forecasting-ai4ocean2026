@@ -1,121 +1,107 @@
-"""Pluggable observation sources that drive analog selection.
+"""Where an observation comes from — the section 1 seam.
 
-An :class:`ObsSource` answers one question: *what did we observe on date X, on the
-model grid?* — returning an :class:`obs_window.ObsDay` (a gridded field plus a
-coverage mask) or None. That single method is the seam that makes the pipeline
-source-agnostic: the model comparing against itself (:class:`SelfSource`, the
-GLORYS-to-GLORYS case), a real satellite swath (:class:`SwotSource`), or a gridded
-L4 product (:class:`OstiaSource`, a stub) all look identical to
-:func:`obs_window.build_window` and everything downstream.
+An :class:`ObsSource` answers one question: *what did we observe on date X, on
+the model grid?* It returns an :class:`~.windows.ObsDay` (a gridded field plus a
+coverage mask) or None. That single method is what makes the pipeline
+source-agnostic: the model observing itself, a real satellite swath, and a
+gridded L4 product all look identical to :func:`~.windows.build_window` and to
+everything downstream.
 
 Instrument-specific policy lives here, not in the window layer — how many
 co-located passes to keep on a day is a property of the observing system, so
-``max_swaths_per_day`` belongs to :class:`SwotSource`.
+``max_swaths_per_day`` belongs to :class:`SwotSource` and to nothing else.
 
-Two optional verification hooks let a source drive a skill loop as well:
-``present_field`` (a dense field at the observation time, for persistence) and
-``verify`` (the truth a forecast is scored against).
+A source is constructed knowing which variable and which anomaly representation
+the chosen distance wants (``distance.var`` / ``distance.representation``), so
+the driver never has to match them up by hand.
 
-Adding an instrument: implement :meth:`ObsSource.observe`, and it inherits
-multi-day windowing, sequence matching, selection and the driver unchanged.
+Adding an instrument: register an :class:`ObsSource` here and it inherits
+multi-day windowing, sequence matching, selection, scoring and plotting unchanged.
 """
 
 from abc import ABC, abstractmethod
 
 import numpy as np
 
-from obs_window import ObsDay
-from swot_analog import swath_to_grid
+from ..registry import Registry
+from .swath import swath_to_grid
+from .windows import ObsDay
+
+SOURCES = Registry("observation source")
 
 
 class ObsSource(ABC):
     """A source of observations, gridded onto the model library's grid."""
 
     name = "source"
-    self_referential = False   # True → obs is a library state; apply temporal exclusion
 
     @abstractmethod
     def observe(self, date, library):
-        """Return an :class:`obs_window.ObsDay` for `date`, or None if nothing usable.
+        """Return an :class:`~.windows.ObsDay` for `date`, or None if nothing usable.
 
         The returned day's ``offset`` is set by the window builder; implementations
-        leave it at its default. Set ``self_index`` only for a self-referential
-        source, where the observation *is* library state `self_index`.
+        leave it at its default.
         """
 
-    def present_field(self, date, library):
-        """Dense surface field at the observation time (for persistence), or None."""
-        return None
-
-    def verify(self, date, lead, library):
-        """Truth for a `lead`-day forecast: (field, mask, dense) or None if absent."""
+    def truth_field(self, date, library):
+        """Dense field at `date` for verification/persistence, or None."""
         return None
 
 
-class SelfSource(ObsSource):
-    """Observation = the library's own surface state (the GLORYS-internal case).
+@SOURCES.register("model")
+class ModelSource(ObsSource):
+    """Observation = the model's own state on that date.
 
-    Reproduces the within-model analog pipeline: every library day is an
-    observation of itself, verified against the dense future library state.
-    Because obs and library are the same series, the day carries ``self_index``,
-    which makes :meth:`analog.AnalogSelector.select` apply a temporal exclusion
-    window so the target's own eddy event cannot leak into its analog pool.
+    The GLORYS-to-GLORYS case. Serves whatever representation the distance asked
+    for, which is why the same source works for a front-geometry selection (raw)
+    and an RMSD selection (standardized).
     """
 
-    name = "self"
-    self_referential = True
+    name = "model"
 
-    def _index(self, date, library):
-        """Library index for a calendar date, or None if outside the record."""
-        d = np.datetime64(str(date)[:10], "D")
-        days = library.times.astype("datetime64[D]")
-        hit = np.flatnonzero(days == d)
-        return int(hit[0]) if hit.size else None
+    def __init__(self, var="ssh", representation="raw", library=None):
+        self.var = var
+        self.representation = representation
+        self.library = library
 
     def observe(self, date, library):
-        i = self._index(date, library)
-        if i is None:
+        library = library or self.library
+        when = np.datetime64(str(date)[:10], "D")
+        if not library.covers(when):
             return None
-        return ObsDay(date=np.datetime64(str(date)[:10], "D"), grid=library.surf[i],
-                      mask=library.ocean, self_index=i)
+        grid = library.at(self.var, str(when), self.representation)
+        if "time" in grid.dims:                  # a date matches a whole day
+            grid = grid.isel(time=0)
+        return ObsDay(date=when, grid=grid.values, mask=library.ocean)
 
-    def present_field(self, date, library):
-        i = self._index(date, library)
-        return None if i is None else library.surf[i]
-
-    def verify(self, date, lead, library):
-        i = self._index(date, library)
-        if i is None or i + lead >= library.n:
+    def truth_field(self, date, library):
+        library = library or self.library
+        when = np.datetime64(str(date)[:10], "D")
+        if not library.covers(when):
             return None
-        return library.surf[i + lead], library.ocean, True
+        field = library.at(self.var, str(when))
+        return field.isel(time=0).values if "time" in field.dims else field.values
 
 
+@SOURCES.register("swot")
 class SwotSource(ObsSource):
     """Observation = real SWOT KaRIn swaths, binned onto the model grid.
 
-    Selection uses the partial swath (an anomaly-only field → pair with
-    ``CorrelationDistance``). ``max_swaths_per_day`` caps how many co-located
-    passes a single day contributes, best-covered first; None keeps every pass.
+    SWOT ``ssha`` is referenced to a mean sea surface and the model to absolute
+    topography, so this must be paired with a distance that centres both sides
+    over the observed cells (``correlation``). A front-geometry distance needs an
+    absolute SSH field and will not work here.
 
-    Verification depends on ``truth_library``:
-
-    * ``None`` → verify against the *future SWOT swath* (partial coverage;
-      supports ACC/RMSE but not the dense Loop Current front MHD). Persistence
-      falls back to the analog nowcast (no dense present field).
-    * a dense ``ModelLibrary`` covering the SWOT era → verify against the dense
-      field at obs-day + lead (enables the front MHD), and use the dense field at
-      the obs day as the persistence baseline.
+    ``max_swaths_per_day`` caps how many co-located passes one day contributes,
+    best-covered first; None keeps every pass.
     """
 
     name = "swot"
-    self_referential = False
 
-    def __init__(self, swaths_for, truth_library=None, max_swaths_per_day=None,
-                 min_cells=500):
-        self.swaths_for = swaths_for         # callable: [dates] -> swaths (or (swaths, labels))
+    def __init__(self, swaths_for, truth_library=None, max_swaths_per_day=None):
+        self.swaths_for = swaths_for       # callable: [dates] -> swaths (or (swaths, labels))
         self.truth_library = truth_library
         self.max_swaths_per_day = max_swaths_per_day
-        self.min_cells = min_cells
 
     @staticmethod
     def _pick(swaths, labels, max_swaths):
@@ -133,10 +119,6 @@ class SwotSource(ObsSource):
         labels = list(labels) if labels else [""] * len(swaths)
         return self._pick(swaths, labels, self.max_swaths_per_day)
 
-    def _grid_date(self, date, library):
-        swaths, _ = self._swaths_on(date)
-        return swath_to_grid(swaths, library.lon, library.lat)
-
     def observe(self, date, library):
         swaths, labels = self._swaths_on(date)
         if not swaths:
@@ -145,37 +127,29 @@ class SwotSource(ObsSource):
         return ObsDay(date=np.datetime64(str(date)[:10], "D"), grid=grid, mask=mask,
                       n_obs=len(swaths), labels=labels)
 
-    def present_field(self, date, library):
+    def truth_field(self, date, library):
+        """The dense field at `date`, from the verification library if there is one."""
         if self.truth_library is None:
             return None
-        return self.truth_library.field_on(date)
-
-    def verify(self, date, lead, library):
-        vday = np.datetime64(str(date)[:10], "D") + np.timedelta64(int(lead), "D")
-        if self.truth_library is not None:
-            field = self.truth_library.field_on(vday)
-            if field is None:
-                return None
-            return field, library.ocean, True                 # dense truth
-        obs2, mask2 = self._grid_date(vday, library)          # partial future swath
-        if mask2.sum() < self.min_cells:
+        when = np.datetime64(str(date)[:10], "D")
+        if not self.truth_library.covers(when):
             return None
-        return obs2, mask2, False
+        field = self.truth_library.at(self.truth_library.var, str(when))
+        return field.isel(time=0).values if "time" in field.dims else field.values
 
 
+@SOURCES.register("ostia")
 class OstiaSource(ObsSource):
-    """Observation = OSTIA L4 SST anomaly, regridded onto the model grid ── STUB.
+    """Observation = OSTIA L4 SST anomaly on the model grid — STUB.
 
-    Intended design: fetch the OSTIA daily L4 foundation SST (CMEMS
-    ``SST_GLO_SST_L4_...`` or PO.DAAC), compute an SST *anomaly* relative to a
-    climatology, and bilinearly regrid onto the model grid, returning an
-    :class:`obs_window.ObsDay` exactly like :class:`SwotSource`. Pair it with
-    :class:`~distances.CorrelationDistance` (SST anomaly is not an absolute SSH
-    field, so the front-MHD selector does not apply). No OSTIA data is on disk yet.
+    Kept as the worked example of what a new instrument has to provide. Intended
+    design: fetch the OSTIA daily L4 foundation SST, subtract an SST climatology,
+    bilinearly regrid onto the model grid, and return an ObsDay exactly as
+    :class:`SwotSource` does. Pair it with the ``correlation`` distance — an SST
+    anomaly is not an absolute SSH field, so the front distances do not apply.
     """
 
     name = "ostia"
-    self_referential = False
 
     def __init__(self, directory="data/ostia"):
         self.directory = directory

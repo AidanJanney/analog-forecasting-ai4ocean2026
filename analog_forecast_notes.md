@@ -1,9 +1,52 @@
 # Analog forecasting — design notes and results
 
-Design decisions and results for `analog_forecast.py`. See `README.md` for setup
-and usage. Last updated 2026-07-27.
+Design decisions and results. See `README.md` for setup and usage.
+Last updated 2026-07-28.
 
 ## What changed
+
+### 2026-07-28 — three sections, one implementation each
+
+The work was split across two standalone drivers that had grown parallel
+implementations of the same ideas: two climatologies, two RMSE/ACC pairs, two
+analog-grid renderers, two ways of spacing the top-K apart. It is now a package
+with one section per stage — `analogfc/data`, `analogfc/distance`,
+`analogfc/forecast` — each a registry, so an option is a decorated class plus a
+config string and the drivers hold orchestration only.
+
+Where the two stacks disagreed numerically, `analog_forecast.py`'s behaviour is
+the one kept: standardized `climday` anomalies, unreferenced front contours, a
+plain-mean ensemble, a calendar-day separation buffer, and front distances in km.
+The SWOT path's variants were dropped rather than carried alongside. Two of its
+pieces survive as *options*, because they answer a real question the GLORYS path
+never faces — `correlation` (partial coverage, mismatched datum) and
+`referenced` front contouring (comparing across eras).
+
+Also removed: the n×n front dissimilarity matrix and its on-disk cache. It only
+paid off for a self-referential library, and with the library and target periods
+disjoint the target-EDT approach is O(n) rather than O(n²) — one transform of the
+target front, then read every library front off it.
+
+Verified by running the restructured driver with latitude weights forced to 1:
+stdout identical to the original on all three selection metrics across 31 leads
+and 5 score metrics, and all 18 figures byte-identical.
+
+### 2026-07-28 — latitude weighting
+
+Every spatial mean is now weighted by cos(latitude): the RMSD selections, RMSE
+and ACC. A cell at 31 N covers ~7% less area than one at 18 N, so the unweighted
+domain mean was overweighting the northern shelf. Front MHD is geometric and
+unchanged.
+
+The effect on the six-year smoke test is small and in the expected direction:
+
+| | change |
+|---|---|
+| `ssh_front_mhd` selection and scores | none — the metric never took a spatial mean |
+| `ssh_rmsd` / `sst_rmsd` selection | same analogs, scores shifted in the 4th decimal; one `sst_rmsd` analog moved by a day (1995-09-23 → 1995-09-22) |
+| RMSE / ACC scores | ~0.5% |
+
+### Earlier
 
 The work used to live in one notebook, `download_glorys.ipynb`, whose second half
 had drifted into analysis. It is now two pieces:
@@ -11,7 +54,7 @@ had drifted into analysis. It is now two pieces:
 | File | Job |
 |---|---|
 | `download_glorys.ipynb` | Download GLORYS from Copernicus Marine and rechunk to Zarr. 14 cells, ends at "Read the Zarr store back". |
-| `analog_forecast.py` | Everything downstream: statistics, analog selection, forecast rollout. |
+| `runs/glorys_analog.py` | Everything downstream: statistics, analog selection, forecast rollout. |
 
 `../subset_glorys.py` is the path actually used for the data on disk — it subsets
 the local GDEX mirror (`/gdex/data/d010049`) rather than downloading, and writes
@@ -46,13 +89,14 @@ SST is `thetao` at `depth=0`; SSH is `zos`.
 ### Configuration lives in YAML
 
 All run parameters are in `config/*.yaml`, selected with `--config`. Paths inside
-a config resolve against `analog_forecast.py`, not the config file or the working
+a config resolve against the repository root, not the config file or the working
 directory, so a config can live anywhere and still find the same data.
 
 `--config` is parsed with `parse_known_args` so the file still runs cell by cell
 in Jupyter and VS Code, where `sys.argv` carries the kernel's own arguments.
 
-`config/smoke_test.yaml` runs six years in about a minute. It replaces the
+`config/smoke_test.yaml` runs six years in about a minute, and
+`tests/test_analogfc.py` runs on synthetic data in about a second. It replaces the
 edit-the-script-and-hope loop that earlier changes were validated with.
 
 ### Climatology day: Feb 29 folded into Feb 28
@@ -127,7 +171,7 @@ This is exact, not an approximation — both methods return 0.7336892639 on the 
 test pair, to all printed digits. It is what makes scoring the entire library
 viable rather than a ±30-day seasonal window.
 
-### MHD runs on raw SSH, RMSD on normalized anomalies
+### MHD runs on raw SSH, RMSD on standardized anomalies
 
 The Loop Current front is a property of the physical SSH field. Normalizing
 pointwise by a daily climatology removes the mean structure that defines it, so

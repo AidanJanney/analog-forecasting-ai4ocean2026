@@ -33,6 +33,6 @@ echo "Config: $CONFIG"
 echo "Started at $(date)"
 
 # PBS accounting often reports zero for a short job, so measure peak RSS here.
-python -u analog_forecast.py --config "$CONFIG"
+python -u runs/glorys_analog.py --config "$CONFIG"
 
 echo "Finished at $(date)"

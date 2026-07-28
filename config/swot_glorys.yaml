@@ -90,6 +90,12 @@ analogs:
   #                 for gridded absolute-SSH observations added later.
   distance: correlation
 
+# Climatology the fields are standardized against, shared with the
+# GLORYS-to-GLORYS run. See config/analog_forecast.yaml for what the knobs do.
+climatology:
+  group: climday
+  reduce_dims: []
+
 forecast:
   # Lead time in days at which the analogs are verified (the headline number).
   lead_days: 14
@@ -99,6 +105,12 @@ forecast:
   # The analog grid's skill curves are evaluated every day out to here, so they
   # are continuous even though the map columns stay at the coarser `map_leads`.
   curve_days: 21
+  # Every window is scored by all of these; the last one is the headline metric
+  # in the per-window log. Same registry as the GLORYS-to-GLORYS run.
+  score_metrics: [ssh_rmse, ssh_acc, ssh_front_mhd]
+  # How the selected analogs become one forecast: ensemble_mean (plain mean),
+  # best_analog (the nearest one), or weighted_mean (Gaussian on distance).
+  combiner: ensemble_mean
 
 verification:
   # Minimum fraction of the Loop Current front the window must observe for the day

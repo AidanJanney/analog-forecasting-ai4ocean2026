@@ -1,82 +1,147 @@
 # Analog forecasting — Gulf of Mexico
 
 Analog forecasts of the Gulf of Mexico Loop Current from the GLORYS12 reanalysis.
-There are two workflows, sharing the same library and front metrics:
 
-| Workflow | Observation | Library | Driver |
+A run is three choices, one per section, wired together by a config file:
+
+```
+data      →  where the observation and the analog pool come from
+distance  →  how library days are ranked against the observation
+forecast  →  how the analogs are combined, scored and drawn
+```
+
+Two workflows differ only in which options they pick:
+
+| Workflow | Observation | Distance | Driver |
 |---|---|---|---|
-| **GLORYS → GLORYS** | a GLORYS state (full field) | GLORYS | `analog_forecast.py` |
-| **SWOT → GLORYS** | real SWOT KaRIn swaths (partial) | GLORYS | `main_swot_glorys.py` |
+| **GLORYS → GLORYS** | a GLORYS state (full field) | `ssh_front_mhd`, `ssh_rmsd`, `sst_rmsd` | `runs/glorys_analog.py` |
+| **SWOT → GLORYS** | real SWOT KaRIn swaths (partial) | `correlation` | `runs/swot_glorys.py` |
 
-They are deliberately separate. In the GLORYS-to-GLORYS case the observation is
-itself a library state, so the ranking sees the full field and needs a temporal
-exclusion window to stop the target's own event leaking into its analog pool. In
-the SWOT-to-GLORYS case the observation is a 2023–2025 satellite swath and the
-pool is pre-2023 GLORYS: coverage is partial, the datums differ (`ssha` against
-`zos`), and the two eras are disjoint so no exclusion is needed.
+In both, the library and target periods are disjoint, so the target day cannot
+leak into its own analog pool and no exclusion window is needed. What genuinely
+differs is the SWOT case's partial coverage and its datum: `ssha` is referenced to
+a mean sea surface and GLORYS `zos` to absolute topography, so it needs a distance
+that centres both sides over the observed cells. That is a choice of option, not a
+separate code path.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `analog_forecast.py` | GLORYS → GLORYS selection and forecast rollout. Standalone: it predates the module layer below and does not import it. |
-| `main_swot_glorys.py` | SWOT → GLORYS driver (see §6). |
-| `obs_window.py` | Multi-day / multi-swath observation windows and sequence matching. |
-| `swot_data.py` | SWOT retrieval from PO.DAAC, and the reduced per-day point cache. |
-| `analog.py` | `ModelLibrary`, analog selection, forecast combiners. |
-| `distances.py` | Pluggable observation-space distances (correlation, front MHD). |
-| `sources.py` | Pluggable observation sources (SWOT, self, OSTIA stub). |
-| `fronts.py` | Loop Current front masks and front-to-front MHD in km. Shared by both workflows. |
-| `mhd.py` | Direct pairwise MHD definition. Reference implementation the tests check `fronts.py` against. |
-| `metrics.py` | Forecast scoring metrics (ACC, RMSE, front MHD). |
-| `viz.py` | Figures. |
-| `config/analog_forecast.yaml` | GLORYS → GLORYS run configuration. |
-| `config/swot_glorys.yaml` | SWOT → GLORYS run configuration. |
-| `config/select_*.yaml` | One per selection metric, for comparing them. |
-| `config/smoke_test.yaml` | Six-year configuration for testing. |
+| `analogfc/registry.py` | Name → factory lookup. One registry per seam. |
+| `analogfc/config.py` | YAML loading and path resolution. |
+| `analogfc/fronts.py` | Loop Current front masks and front-to-front MHD in km. |
+| `analogfc/mhd.py` | Direct pairwise MHD. The reference the tests check `fronts.py` against. |
+| **`analogfc/data/`** | **Section 1 — getting data.** |
+| `data/glorys.py` | Open the Zarr stores; `Field` / `FieldSet` and their representations. |
+| `data/climatology.py` | `climday` grouping, standardization, and the map back to physical units. |
+| `data/library.py` | `ModelLibrary` — the analog pool plus grid metadata. |
+| `data/sources.py` | `ObsSource` registry: `model`, `swot`, `ostia` (stub). |
+| `data/windows.py` | Multi-day observation windows and sequence matching. |
+| `data/swot.py` | SWOT retrieval from PO.DAAC and the per-day point cache. |
+| `data/swath.py` | Bin along-track points onto the model grid. |
+| `data/diagnostics.py` | Input-data figures (variance, distribution, variation). |
+| **`analogfc/distance/`** | **Section 2 — identifying analogs.** |
+| `distance/base.py` | `ObsDistance`, the `DISTANCES` registry, weighted kernels. |
+| `distance/anomaly_rmsd.py` | `ssh_rmsd`, `sst_rmsd` — RMSD of standardized anomalies. |
+| `distance/front_mhd.py` | `ssh_front_mhd` — Loop Current front displacement in km. |
+| `distance/correlation.py` | `correlation` — pattern correlation over observed cells. |
+| `distance/latent.py` | `latent` — learned latent-space distance (stub). |
+| `distance/select.py` | `AnalogSet`, `AnalogSelector`, top-K with a separation buffer. |
+| **`analogfc/forecast/`** | **Section 3 — rollout, scoring, plotting.** |
+| `forecast/combine.py` | `COMBINERS`: `ensemble_mean`, `best_analog`, `weighted_mean`. |
+| `forecast/rollout.py` | Advance a selection to every lead, in physical units. |
+| `forecast/score.py` | `METRICS`: `sst_rmse`, `ssh_rmse`, `sst_acc`, `ssh_acc`, `ssh_front_mhd`. |
+| `forecast/plots.py` | Analog grids, target-vs-best, per-window skill. |
+| `runs/glorys_analog.py` | GLORYS → GLORYS driver. Orchestration only. |
+| `runs/swot_glorys.py` | SWOT → GLORYS driver. |
+| `tests/test_analogfc.py` | The suite. No data files, no pytest: `python tests/test_analogfc.py`. |
+| `config/*.yaml` | Run configurations. |
 | `submit_analog_forecast.pbs` | Casper PBS batch submission. |
 | `../subset_glorys.py` | Subset the GDEX GLORYS mirror to per-year Zarr stores. |
-| `../submit_subset.pbs` | Casper job array over years for the above. |
 | `download_glorys.py`, `download_glorys.ipynb` | Download GLORYS from Copernicus Marine. |
 | `analog_forecast_notes.md` | Design decisions and results. |
 
-### Module architecture
+### Adding an option
 
-`main_swot_glorys.py` is one pipeline built from three swappable seams. Each has a
-single abstract method, and changing one never touches the others:
+Each section is a registry. An option is a decorated class and a config string —
+no driver changes, and every other section is untouched.
 
+**A distance** (how analogs are ranked). Declare which variable and which anomaly
+representation it consumes, and the observation source is wired to match:
+
+```python
+# analogfc/distance/my_metric.py
+@DISTANCES.register("my_metric")
+class MyDistance(ObsDistance):
+    var, representation = "ssh", "standardized"   # or "raw" / "anomaly"
+
+    def prepare(self, library):
+        self.pool = library.pool(self.var, self.representation).values
+        return self
+
+    def distance(self, obs_grid, mask=None):
+        """One score per library day; lower is better, np.inf if unscorable."""
+        return ...
 ```
-sources.ObsSource     .observe(date, library) -> ObsDay      where the observation comes from
-        |                                                    (SwotSource, SelfSource, OstiaSource stub)
-        v
-obs_window.build_window(source, end, library, n_days=...)     n consecutive days -> one ObsWindow
-        |
-        v
-distances.ObsDistance .distance(grid, mask) -> (n,)          how it is ranked against the library
-        |                                                    (CorrelationDistance, FrontMHDDistance)
-        v
-analog.AnalogSelector .select(window, lead, k) -> AnalogSet   which library states are the analogs
-        |
-        v
-analog.Combiner       (analogs, state, lead) -> field        how they become a forecast
-                                                             (EnsembleMean, BestAnalog)
+
+Import it in `analogfc/distance/__init__.py`, then set `selection_metric: my_metric`.
+
+**A score metric** (how a forecast is judged). Register a factory taking the
+library; declare `unit` and `higher_is_better` and the reporting follows:
+
+```python
+@METRICS.register("ssh_bias")
+def _ssh_bias(library, **kw):
+    return MyBias("ssh", library)
 ```
 
-Selection and forecasting are decoupled: an `AnalogSet` is just indices plus
-distances, so the same selection can be rolled out to many leads or scored on its
-own. `metrics.ErrorMetric` then scores the result (ACC, RMSE, front MHD in km).
+Then add `ssh_bias` to `forecast.score_metrics`.
+
+**An observation type.** Implement one method and it inherits multi-day
+windowing, sequence matching, selection, scoring and plotting unchanged:
+
+```python
+@SOURCES.register("my_instrument")
+class MySource(ObsSource):
+    def observe(self, date, library):
+        """Return an ObsDay for `date`, or None if nothing usable."""
+        grid, mask = ...            # (nlat, nlon) on library.lon / library.lat
+        return ObsDay(date=date, grid=grid, mask=mask)
+```
+
+See `data/sources.py:OstiaSource` for a worked stub. For a one-off set of
+already-gridded fields you can skip sources entirely and build a window with
+`windows.window_from_days(end_date, grids, masks, dates)`.
+
+**A combiner** (how analogs become one forecast): register a function of
+`(members, distances)` in `forecast/combine.py` and set `forecast.combiner`.
+
+### Anomaly representations
+
+Distances declare which one they need, because using the wrong one is a silent
+error rather than a crash:
+
+| Representation | Definition | Used by |
+|---|---|---|
+| `raw` | the physical field | front geometry — the front is a property of physical SSH, and the standardized anomaly has exactly the mean structure that defines it removed |
+| `standardized` | `(x − μ)/σ` per climatology group per grid cell | the RMSD selections and the forecast rollout |
+| `anomaly` | `x −` time mean | cross-datum correlation — mean removed but *not* rescaled per cell, since an instrument anomaly has had no such rescaling applied |
+
+They are built on first use, so a run only pays for the ones it asks for.
 
 ### The Loop Current front
 
-Both workflows use one definition, in `fronts.py`. A front is a **boolean grid
-mask**: the cells the 0.17 m `zos` contour passes through (Leben 2005), taken as
-the inside edge of the region at or above the level so coastlines are excluded.
+Both workflows use one definition, in `analogfc/fronts.py`. A front is a **boolean
+grid mask**: the cells the 0.17 m `zos` contour passes through (Leben 2005), taken
+as the inside edge of the region at or above the level so coastlines are excluded.
 
 Distance between two fronts is the modified Hausdorff distance, evaluated with a
 Euclidean distance transform — the EDT of one front *is* the "distance to the
 nearest front cell" field the MHD needs, so a comparison costs one transform
 instead of an O(|A|·|B|) pairwise sweep, with no vertex subsampling. `mhd.py`
-holds the direct pairwise definition and the tests confirm the two agree exactly.
+holds the direct pairwise definition and `tests/test_analogfc.py` confirms the
+two agree exactly.
 
 Results are in **km**: `fronts.grid_spacing_km` gives the transform the physical
 cell size, which also corrects the grid's anisotropy (a degree of longitude at
@@ -84,12 +149,15 @@ cell size, which also corrects the grid's anisotropy (a degree of longitude at
 
 | Option | Effect |
 |---|---|
-| `ref_mean` | Shift the field's ocean mean to a common datum before contouring, so the fixed level tracks the front's *position* rather than a basin-scale sea-level offset. Essential when comparing across eras. |
-| `main_only` | Keep only the largest connected segment — the Loop Current filament itself, not detached rings that also cross the level. |
+| `referenced` | Shift each field's ocean mean to a common datum before contouring, so the fixed level tracks the front's *position* rather than a basin-scale sea-level offset. Off within one reanalysis; on when comparing across datasets or eras. |
+| `main_only` | Keep only the largest connected segment — the Loop Current filament itself, not detached rings that also cross the level. Unstable where the domain's eastern cut clips the contour, so it is off by default. |
 
-There is one selector and one window builder for both workflows — a one-day window
-is the single-observation case, and the sequence distance over a single day
-reduces to that day's distance exactly.
+### Latitude weighting
+
+Every spatial mean — the RMSD selections, RMSE, ACC — is weighted by
+cos(latitude). A grid cell at 31 N covers about 7% less area than one at 18 N, so
+an unweighted domain mean over the Gulf box overweights the northern shelf. Front
+MHD is geometric and unaffected.
 
 ## 1. Environment
 
@@ -152,8 +220,8 @@ python download_glorys.py rechunk data/glorys_gom_1993.nc glorys_gom_1993_subset
 ## 3. Run a forecast
 
 ```bash
-python analog_forecast.py                                    # config/analog_forecast.yaml
-python analog_forecast.py --config config/smoke_test.yaml
+python runs/glorys_analog.py                                 # config/analog_forecast.yaml
+python runs/glorys_analog.py --config config/smoke_test.yaml
 ```
 
 On Casper:
@@ -170,8 +238,8 @@ request more before running it by hand:
 qsub -I -A P93300012 -q casper -l select=1:ncpus=8:mem=128GB -l walltime=06:00:00
 ```
 
-`analog_forecast.py` is a `# %%` cell script and also runs cell by cell in VS Code
-or Jupyter.
+Both drivers are `# %%` cell scripts and also run cell by cell in VS Code or
+Jupyter.
 
 ### Output
 
@@ -191,7 +259,7 @@ Analog dates, scores, and domain RMSE by lead are printed to stdout.
 
 ## 4. Configuration
 
-Paths are resolved relative to `analog_forecast.py`, not the config file.
+Paths are resolved relative to the repository root, not the config file.
 
 | Key | Meaning |
 |---|---|
@@ -206,15 +274,16 @@ Paths are resolved relative to `analog_forecast.py`, not the config file.
 | `climatology.group` | Grouping for the normalization statistics. `climday` folds Feb 29 into Feb 28; `time.dayofyear` and `time.month` also accepted. |
 | `climatology.reduce_dims` | Extra dims to average over. Empty gives one mean and standard deviation per group per grid cell. |
 | `analogs.target_date` | Day being forecast. |
-| `analogs.selection_metric` | How library days are ranked: `sst_rmsd`, `ssh_rmsd`, or `ssh_front_mhd`. |
+| `analogs.selection_metric` | How library days are ranked. Any name in `DISTANCES`: `sst_rmsd`, `ssh_rmsd`, `ssh_front_mhd`. |
 | `analogs.k` | Number of analogs retained. |
 | `analogs.buffer_days` | Minimum separation between retained analogs. Nothing to do with forecast length. |
 | `analogs.ssh_contour_level` | SSH contour defining the Loop Current front, in metres. |
 | `forecast.length_days` | How far the rollout runs. Errors are evaluated every day out to here. |
 | `forecast.lead_days` | Leads shown as map columns in the analog grids. Must fall within `length_days`. |
-| `forecast.score_metrics` | Metrics every forecast is scored by: `sst_rmse`, `ssh_rmse`, `sst_acc`, `ssh_acc`, `ssh_front_mhd`. ACC is a skill score, so higher is better; the rest are errors. |
+| `forecast.score_metrics` | Metrics every forecast is scored by. Any names in `METRICS`: `sst_rmse`, `ssh_rmse`, `sst_acc`, `ssh_acc`, `ssh_front_mhd`. ACC is a skill score, so higher is better; the rest are errors. |
+| `forecast.combiner` | How the analogs become one forecast. Any name in `COMBINERS`: `ensemble_mean` (plain mean), `best_analog`, `weighted_mean`. |
 
-## 5. Testing a new metric on a small subset
+## 5. Testing a new option on a small subset
 
 Ranking the full library takes several minutes per run. Work against a six-year
 subset first.
@@ -238,26 +307,19 @@ subset first.
    Set `data.zarr_glob` to match the subset, `data.fig_dir` to a separate
    directory, and keep `periods.library` and `periods.target` disjoint.
 
-3. Add the metric to `analog_forecast.py`. A ranking needs two pieces:
+3. Add the option — see "Adding an option" above — and name it in the config.
 
-   - a score per library day, as a `DataArray` indexed by `time`
-   - `select_top_k_buffer(score, score, k=K, buffer=BUFFER_DAYS)` to take the
-     top-K while enforcing the separation
-
-   Follow `front_mhd()`, which scores every library day against the target and
-   wraps the result in a `DataArray`. Lower scores rank better; return `np.inf`
-   for a day that cannot be scored, so it is never selected.
-
-4. Run and inspect:
+4. Check nothing else moved:
 
    ```bash
-   python analog_forecast.py --config config/my_metric.yaml
+   python tests/test_analogfc.py
+   python runs/glorys_analog.py --config config/my_metric.yaml
    ```
 
-   `plot_analog_grid` accepts any set of analog times, so a new ranking can be
-   plotted by passing its `top_*.time.values`.
+   The suite runs on synthetic data in about a second and needs no GLORYS files,
+   so it is the fast check; the smoke config is the slow one.
 
-5. Once the metric is settled, run the full record with
+5. Once the option is settled, run the full record with
    `config/analog_forecast.yaml`.
 
 A six-year library is too short for meaningful analogs. Use it to check that code
@@ -282,7 +344,7 @@ granules already on disk, so re-running the same command resumes an interrupted
 download:
 
 ```bash
-python swot_data.py fetch-range --start 2023-01-01 --end 2025-12-31
+python -m analogfc.data.swot fetch-range --start 2023-01-01 --end 2025-12-31
 ```
 
 SWOT KaRIn data does not exist before **2023-03-28**, so a request starting
@@ -299,14 +361,14 @@ to a compact `.npz` of in-box points (~1 MB/day) under `data/swot_points/`. That
 cache is what the driver reads, so the bulky granules can be deleted afterwards:
 
 ```bash
-python swot_data.py cache          # reduce granules already downloaded
+python -m analogfc.data.swot cache          # reduce granules already downloaded
 ```
 
 ### 6.2 Run
 
 ```bash
-python main_swot_glorys.py                                 # config/swot_glorys.yaml
-python main_swot_glorys.py --config config/my_swot.yaml
+python runs/swot_glorys.py                                 # config/swot_glorys.yaml
+python runs/swot_glorys.py --config config/my_swot.yaml
 ```
 
 ### 6.3 The observation window
@@ -342,33 +404,18 @@ Written to `data.fig_dir` (default `figures_swot_glorys/`):
 
 | File | Contents |
 |---|---|
-| `swot_analogs.png` | The window's binned SSHA beside its top-K GLORYS analogs. |
-| `analog_grid.png` | One row per analog (state, then misfit), then the ensemble and the truth. Columns are the SWOT observation and each lead in `forecast.map_leads`, with the 0.17 m contour drawn on every panel — black for the truth, dashed in the row's colour for its own. The right column carries daily ACC, RMSE and front-MHD curves for every member against the ensemble and persistence. |
-| `analog_glorys_lc_skill.png` | Loop Current front MHD per window vs persistence. |
-| `analog_glorys_skill.png` | Full-field ACC/RMSE per window vs persistence. |
+| `observation_analogs.png` | The window's binned SSHA beside its top-K GLORYS analogs. |
+| `analog_grid.png` | One row per analog (state, then error), then the ensemble and the truth. Columns are each lead in `forecast.map_leads`, with the 0.17 m contour drawn on every panel — black for the truth, dashed in the row's colour for its own. The right column carries one daily skill curve per metric in `forecast.score_metrics`. |
+| `swot_window_skill.png` | One panel per metric: each analog, the ensemble and persistence, per observation window. |
 
 ### 6.5 Adding another observation type
 
-`sources.ObsSource` is the seam, and it has exactly one required method:
-
-```python
-class MySource(ObsSource):
-    def observe(self, date, library):
-        """Return an obs_window.ObsDay for `date`, or None if nothing usable."""
-        grid, mask = ...            # (nlat, nlon) on library.lon / library.lat
-        return ObsDay(date=date, grid=grid, mask=mask)
-```
-
-Implement that — see the `OstiaSource` stub — and `obs_window.build_window` gives
-it multi-day windowing, sequence matching, selection and the whole driver
+See "Adding an option" above: register an `ObsSource` and the whole driver is
 unchanged. Instrument-specific policy (how many observations to keep per day, how
-to read the files) belongs in the source; the window layer imports nothing but
-numpy and never learns what an instrument is.
+to read the files) belongs in the source; the window layer never learns what an
+instrument is.
 
-For a one-off set of already-gridded fields you can skip `sources` entirely and
-build a window with `obs_window.window_from_days(end_date, grids, masks, dates)`.
-
-Pair anomaly-like observations with `distance: correlation`; it centres both
-fields over the observed cells, so a sensor's datum need not match GLORYS `zos`.
-The `front_mhd` distance needs an *absolute* SSH field and will not work on an
+Pair anomaly-like observations with `distance: correlation`, which centres both
+fields over the observed cells so a sensor's datum need not match GLORYS `zos`.
+The `ssh_front_mhd` distance needs an *absolute* SSH field and will not work on an
 anomaly-only swath.

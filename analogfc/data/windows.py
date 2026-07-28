@@ -11,24 +11,25 @@ Two knobs, both modular, matching how the observing system actually behaves:
 * ``n_days`` — how many consecutive days the window spans. 1 reproduces the
   original single-day behaviour exactly.
 * how many observations to keep per day — owned by the source, since it is
-  instrument-specific (:class:`sources.SwotSource` takes ``max_swaths_per_day``).
+  instrument-specific (:class:`~.sources.SwotSource` takes ``max_swaths_per_day``).
 
 The window is matched against the library as a *sequence*, not as one flattened
-field (see :meth:`ObsWindow.sequence_distance`): day *o* of the window is compared
+field (see :meth:`ObsWindow.sequence_scores`): day *o* of the window is compared
 against the library state *o* days before the candidate. A candidate analog
 therefore has to reproduce the whole observed evolution, not just the final
 snapshot, and a front moving through the window is not smeared into a thick blur
 the way flattening every day onto one grid would smear it.
 
-This module is deliberately free of any instrument knowledge — it imports nothing
-but numpy. A day is a gridded field plus a coverage mask (:class:`ObsDay`), which
-is all any observation reduces to. Where those arrays come from is the business of
-:mod:`sources`; how they are ranked against the library is the business of
-:mod:`distances`.
+This module is deliberately free of any instrument knowledge. A day is a gridded
+field plus a coverage mask (:class:`ObsDay`), which is all any observation
+reduces to, whatever its native geometry. Where those arrays come from is the
+business of
+:mod:`.sources`; how they are ranked against the library is the business of
+:mod:`..distance`.
 
 Two ways in, one representation out:
 
-* :func:`build_window` — pull `n_days` back from a :class:`sources.ObsSource`.
+* :func:`build_window` — pull `n_days` back from a :class:`~.sources.ObsSource`.
 * :func:`window_from_days` — hand over pre-gridded (grid, mask) pairs directly,
   for an observation type that has no ``ObsSource`` yet.
 """
@@ -38,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+import xarray as xr
 
 DAY = np.timedelta64(1, "D")
 
@@ -51,10 +53,6 @@ class ObsDay:
     `offset` is how many days before the window's end this day sits (0 = the
     window's last/newest day), which is what aligns it to the library sequence.
 
-    `self_index` is the library index this day *is*, for a self-referential
-    source (the GLORYS-to-GLORYS case), and None for an independent observation.
-    It lets matrix-backed distances take their fast path and drives the
-    temporal-exclusion leakage guard in :meth:`analog.AnalogSelector.select`.
     """
 
     date: np.datetime64
@@ -63,7 +61,6 @@ class ObsDay:
     offset: int = 0
     n_obs: int = 1
     labels: list = field(default_factory=list)
-    self_index: int | None = None
 
     @property
     def n_cells(self):
@@ -107,17 +104,12 @@ class ObsWindow:
         return int(sum(d.n_obs for d in self.days))
 
     @property
-    def self_index(self):
-        """Library index of the window's newest day, for a self-referential source."""
-        return self.days[0].self_index if self.days else None
-
-    @property
     def coverage_mask(self):
         """Union of the days' masks — everywhere the window saw *something*.
 
         This is what answers "did this window sample the Loop Current at all",
         and what the figures outline. It is deliberately not what the matching
-        uses: :meth:`sequence_distance` keeps the days separate so each is
+        uses: :meth:`sequence_scores` keeps the days separate so each is
         compared against its own library day.
         """
         m = np.zeros_like(self.days[0].mask, dtype=bool)
@@ -142,34 +134,36 @@ class ObsWindow:
         with np.errstate(invalid="ignore"):
             return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
 
-    def sequence_distance(self, distance, n):
-        """Distance from this window to every library state, as a sequence match.
+    def sequence_scores(self, selector):
+        """Scores against every library day, as a sequence match.
 
-        Composes any :class:`distances.ObsDistance` over the window's days::
+        Composes any :class:`~..distance.base.ObsDistance` over the window's days::
 
             D[j] = sum_o  w_o * d_o[j - o]
 
-        where `j` is the library index aligned with the window's *end* and `o` is
-        a day's offset back from that end. Candidates too close to the start of
-        the library to have a full history (``j < max_offset``) are marked
-        infinite and so are never selected.
+        where `j` is the library day aligned with the window's *end* and `o` is a
+        day's offset back from that end. So a candidate has to reproduce the whole
+        observed evolution, not just the final snapshot — and a front moving
+        through the window is not smeared the way flattening every day onto one
+        grid would smear it. Candidates too close to the start of the library to
+        have a full history are marked infinite and never selected.
 
-        Returns an (n,) array. With a 1-day window this is exactly the single-day
-        distance, so the windowed path and the single-day path agree by
+        Returns a DataArray indexed by time. With a one-day window this reduces to
+        exactly that day's distance, so the windowed and single-day paths agree by
         construction.
         """
+        n = selector.library.n
         total = np.zeros(n, dtype=float)
         for day, w in zip(self.days, self.weights):
-            d = np.asarray(distance.distance(day.grid, day.mask,
-                                             self_index=day.self_index), dtype=float)
+            d = np.asarray(selector.distance.distance(day.grid, day.mask), dtype=float)
             o = int(day.offset)
             if o == 0:
                 shifted = d
             else:
                 shifted = np.full(n, np.inf)
-                shifted[o:] = d[:-o]      # library index j aligns with day j - o
+                shifted[o:] = d[:-o]      # library day j aligns with the window's j - o
             total = total + w * shifted
-        return total
+        return xr.DataArray(total, coords={"time": selector.library.times}, dims="time")
 
     def describe(self):
         parts = [f"{str(d.date)[:10]}(-{d.offset}d, {d.n_obs}ob, {d.n_cells}c)"
@@ -213,16 +207,16 @@ def build_window(source, end_date, library, n_days=1, min_cells_per_day=1,
     Walks back `n_days` from the window end, asking the source what it saw on each
     date. Because the source is the only thing that knows about instruments, this
     one function serves SWOT, a future L4 SST product, and the model observing
-    itself — a new instrument implements :meth:`sources.ObsSource.observe` and
+    itself — a new instrument implements :meth:`~.sources.ObsSource.observe` and
     inherits windowing, sequence matching and the whole driver.
 
     Parameters
     ----------
-    source : sources.ObsSource
+    source : ~.sources.ObsSource
         Supplies ``observe(date, library) -> ObsDay | None``.
     end_date : str or datetime64
         Last (newest) day of the window; the forecast is launched from here.
-    library : analog.ModelLibrary
+    library : ~.library.ModelLibrary
         The model library, which defines the grid the observation is binned onto.
     n_days : int
         Number of consecutive calendar days in the window (1 = a single day).
@@ -250,7 +244,7 @@ def build_window(source, end_date, library, n_days=1, min_cells_per_day=1,
 
 
 def window_from_days(end_date, grids, masks, dates, weights="uniform", halflife=3.0):
-    """Build a window from pre-gridded fields, bypassing :mod:`sources`.
+    """Build a window from pre-gridded fields, bypassing :mod:`.sources`.
 
     The escape hatch for an observation type that has no ``ObsSource`` yet: produce
     (grid, mask) pairs on the model grid and their dates, and everything downstream
@@ -273,7 +267,7 @@ def available_windows(dates, stride=1):
     """Candidate window end-dates: every observed date, thinned by `stride`.
 
     `dates` is the list of dates with observations on disk (e.g.
-    ``swot_data.observed_dates()``). A window is only *attempted* here; whether it
+    ``.swot.observed_dates()``). A window is only *attempted* here; whether it
     has enough usable days is decided by :func:`build_window`.
     """
     ends = sorted({np.datetime64(str(d)[:10], "D") for d in dates})

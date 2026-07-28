@@ -1,76 +1,50 @@
-# %% SWOT-to-GLORYS analog forecasting.
-#
-# Real SWOT KaRIn swaths from the 2023-2025 target period initialize the forecast;
-# analogs are drawn from the disjoint 1993-2022 GLORYS library and verified against
-# the dense GLORYS field at obs + LEAD.
-#
-# This is the SWOT-to-GLORYS workflow and is deliberately distinct from the
-# GLORYS-to-GLORYS one in analog_forecast.py:
-#
-#                     GLORYS -> GLORYS            SWOT -> GLORYS (here)
-#   observation       a library state             a real swath, partial coverage
-#   obs space         full field                  only the observed cells
-#   datum             same as library             ssha vs zos -> correlation distance
-#   leakage guard     temporal exclusion window   none needed: disjoint eras
-#   initialization    one day                     a window of consecutive days
-#
-# The forecast is initialized from an *observation window* (obs_window): a run of
-# consecutive days, each holding however many swaths fell in the box, matched
-# against the library as a sequence rather than as one flattened field. Set
-# `observation.n_days: 1` and `max_swaths_per_day: 1` for the single-swath case.
-#
-# Three seams, each swappable without touching the others:
-#   sources.ObsSource    where the observation comes from  (SwotSource here)
-#   distances.ObsDistance how it is ranked against the library (correlation here)
-#   analog.Combiner      how the chosen analogs become a forecast (ensemble mean)
-#
-# Adding another observation type means implementing ObsSource.observe for it;
-# windowing, sequence matching, selection and everything below are unchanged.
-#
-# Prerequisites:
-#   python swot_data.py fetch-range --start 2023-01-01 --end 2025-12-31
-#   (needs a one-time Earthdata login; see swot_data's module docstring)
-import argparse
+# %%
+"""SWOT-to-GLORYS analog forecasting.
+
+Real SWOT KaRIn swaths from 2023-2025 initialize the forecast; analogs come from
+the disjoint pre-2023 GLORYS library and are verified against the dense GLORYS
+field at obs + lead.
+
+The same three sections as runs/glorys_analog.py, with one option swapped in
+each — which is the point of the structure:
+
+    data      observation is a partial swath, not a model state   SwotSource
+    distance  ranked on pattern correlation over observed cells   correlation
+    forecast  identical: rollout, score, plot                     unchanged
+
+Two things differ from the GLORYS-to-GLORYS run and both are handled by the
+choice of options, not by separate code. Coverage is partial, so the distance
+must work on a mask. The datums differ (``ssha`` against ``zos``), so the
+distance must centre both sides — which the correlation distance does and the
+front-geometry distance cannot, since it needs an absolute SSH field.
+
+Prerequisites:
+    python -m analogfc.data.swot fetch-range --start 2023-01-01 --end 2025-12-31
+    (needs a one-time Earthdata login; see analogfc/data/swot.py)
+
+    python runs/swot_glorys.py --config config/swot_glorys.yaml
+"""
+
 import os
+import sys
 
-import matplotlib.pyplot as plt
 import numpy as np
-import xarray as xr
-import yaml
 
-import obs_window as ow
-import sources
-import swot_data
-import swot_analog as sa
-import viz
-from analog import ModelLibrary, Forecast, AnalogSelector
-from distances import CorrelationDistance, FrontMHDDistance
-from fronts import front_coverage, front_mask, referenced
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, "config", "swot_glorys.yaml")
+from analogfc import config as cfg
+from analogfc.data import glorys, sources, swot, windows as ow
+from analogfc.data.library import ModelLibrary
+from analogfc.distance import DISTANCES, AnalogSelector
+from analogfc.forecast import plots, rollout as fc, score as scoring
+from analogfc.fronts import front_coverage, front_mask
 
-# parse_known_args so the script still runs cell by cell in Jupyter/VS Code,
-# where sys.argv carries the kernel's own arguments.
-parser = argparse.ArgumentParser(description="SWOT-to-GLORYS analog forecasting.")
-parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to the YAML config.")
-args, _ = parser.parse_known_args()
+config = cfg.load("config/swot_glorys.yaml", "SWOT-to-GLORYS analog forecasting.")
 
-with open(args.config) as fh:
-    config = yaml.safe_load(fh)
-print(f"Config: {args.config}")
-
-
-def config_path(value):
-    """Resolve a config path against this script, not the config or the cwd."""
-    return value if os.path.isabs(value) else os.path.normpath(
-        os.path.join(SCRIPT_DIR, value))
-
-
-ZARR_GLOB = config_path(config["data"]["zarr_glob"])
-SWOT_DIR = config_path(config["data"]["swot_dir"])
-POINTS_DIR = config_path(config["data"]["swot_points_dir"])
-FIG_DIR = config_path(config["data"]["fig_dir"])
+ZARR_GLOB = cfg.resolve(config["data"]["zarr_glob"])
+SWOT_DIR = cfg.resolve(config["data"]["swot_dir"])
+POINTS_DIR = cfg.resolve(config["data"]["swot_points_dir"])
+FIG_DIR = cfg.resolve(config["data"]["fig_dir"])
 
 LIBRARY = config["periods"]["library"]
 TARGET = config["periods"]["target"]
@@ -79,92 +53,89 @@ K = config["analogs"]["k"]
 MIN_SEP = config["analogs"]["min_sep"]
 DISTANCE_NAME = config["analogs"]["distance"]
 LEAD = config["forecast"]["lead_days"]
-MAP_LEADS = config["forecast"]["map_leads"]      # leads shown as map columns
-CURVE_DAYS = config["forecast"]["curve_days"]    # skill curves evaluated daily to here
+MAP_LEADS = config["forecast"]["map_leads"]
+CURVE_DAYS = config["forecast"]["curve_days"]
+SCORE_METRIC_NAMES = config["forecast"].get(
+    "score_metrics", ["ssh_rmse", "ssh_acc", "ssh_front_mhd"])
+COMBINER = config["forecast"].get("combiner", "ensemble_mean")
 FRONT_COVER_MIN = config["verification"]["front_cover_min"]
 LEVEL = config["verification"]["ssh_contour_level"]
 K_SHOW = config["figures"]["k_show"]
 DEMO_DAY = config["figures"]["demo_day"]
 
-DISTANCES = {"correlation": CorrelationDistance, "front_mhd": FrontMHDDistance}
-if DISTANCE_NAME not in DISTANCES:
-    raise ValueError(f"unknown distance {DISTANCE_NAME!r}; choose from {sorted(DISTANCES)}")
-
 os.makedirs(FIG_DIR, exist_ok=True)
 
-# %% Load GLORYS once, then split it into the analog pool and the dense truth.
-# Both come from the same store, so they share a grid by construction and the
-# forecast/truth comparison needs no regridding.
-ds = xr.open_mfdataset(ZARR_GLOB, engine="zarr", combine="by_coords")
-ds = ds[["zos"]].sel(
-    longitude=slice(config["domain"]["min_longitude"], config["domain"]["max_longitude"]),
-    latitude=slice(config["domain"]["min_latitude"], config["domain"]["max_latitude"]),
-)
-print(f"GLORYS {ZARR_GLOB}: {ds.sizes['time']} days, "
-      f"{ds.sizes['latitude']} x {ds.sizes['longitude']} grid")
+# %% -- Section 1: getting data ---------------------------------------------- #
+# Library and truth come from the same store, so they share a grid by
+# construction and the forecast/truth comparison needs no regridding.
+lon_slice, lat_slice = cfg.domain_slices(config)
+fields = glorys.open_glorys(ZARR_GLOB, lon_slice, lat_slice, variables=("ssh",),
+                            group=config.get("climatology", {}).get("group", "climday"),
+                            reduce_dims=tuple(
+                                config.get("climatology", {}).get("reduce_dims", [])))
 
-lib_ds = ds.sel(time=slice(LIBRARY["start"], LIBRARY["end"])).load()
-truth_ds = ds.sel(time=slice(TARGET["start"], TARGET["end"])).load()
-
-lib = ModelLibrary(lib_ds, var="zos")
-truth = ModelLibrary(truth_ds, var="zos")
-day = np.datetime_as_string(lib.times, unit="D")
-print(f"  library : {lib.n} states, {day[0]} .. {day[-1]}  (analog pool)")
+library = ModelLibrary(fields, period=slice(LIBRARY["start"], LIBRARY["end"]), var="ssh")
+truth = ModelLibrary(fields, period=slice(TARGET["start"], TARGET["end"]), var="ssh")
+print(f"  library : {library.n} states, "
+      f"{np.datetime_as_string(library.times[0], unit='D')} .. "
+      f"{np.datetime_as_string(library.times[-1], unit='D')}  (analog pool)")
 print(f"  truth   : {truth.n} states, "
       f"{np.datetime_as_string(truth.times[0], unit='D')} .. "
       f"{np.datetime_as_string(truth.times[-1], unit='D')}  (dense verification)")
 
 # The library is matched as a *sequence*, so its days must be contiguous: index
-# arithmetic (j - offset) is only day arithmetic if there are no gaps.
-gaps = np.unique(np.diff(lib.times))
+# arithmetic is only day arithmetic if there are no gaps.
+gaps = np.unique(np.diff(library.times))
 assert len(gaps) == 1, f"library time axis is not contiguous daily: {gaps}"
 
-# %% Observation windows over the SWOT era.
-swot_days = [d for d in swot_data.observed_dates(SWOT_DIR, POINTS_DIR)
+swot_days = [d for d in swot.observed_dates(SWOT_DIR, POINTS_DIR)
              if TARGET["start"] <= d <= TARGET["end"]]
 if not swot_days:
     raise SystemExit(
         f"No SWOT granules in {SWOT_DIR} for {TARGET['start']}..{TARGET['end']}.\n"
         f"Fetch them first:\n"
-        f"  python swot_data.py fetch-range --start {TARGET['start']} "
+        f"  python -m analogfc.data.swot fetch-range --start {TARGET['start']} "
         f"--end {TARGET['end']} --collection {config['swot']['collection']}")
-print(f"SWOT: {len(swot_days)} observed days on disk, "
-      f"{swot_days[0]} .. {swot_days[-1]}")
+print(f"SWOT: {len(swot_days)} observed days on disk, {swot_days[0]} .. {swot_days[-1]}")
 
 
 def swaths_for(dates):
     """This run's swath source: cached per-day points, falling back to granules."""
-    return swot_data.swaths_for_dates(dates, directory=SWOT_DIR,
-                                      bbox=tuple(config["swot"]["bbox"]),
-                                      cache_dir=POINTS_DIR)
+    return swot.swaths_for_dates(dates, directory=SWOT_DIR,
+                                 bbox=tuple(config["swot"]["bbox"]),
+                                 cache_dir=POINTS_DIR)
 
 
-# The observation seam: SwotSource answers "what did SWOT see on date X, on the
-# model grid". Swap it for another ObsSource to drive the same pipeline with a
-# different instrument — nothing below this line is SWOT-specific.
-source = sources.SwotSource(swaths_for, truth_library=truth,
-                            max_swaths_per_day=OBS["max_swaths_per_day"])
-selector = AnalogSelector(lib, DISTANCES[DISTANCE_NAME]())
-forecaster = Forecast(lib)              # distance-weighted ensemble mean
+source = sources.SOURCES.create("swot", swaths_for=swaths_for, truth_library=truth,
+                                max_swaths_per_day=OBS["max_swaths_per_day"])
+
+# %% -- Section 2: identifying analogs ---------------------------------------- #
+distance = DISTANCES.create(DISTANCE_NAME)
+if DISTANCE_NAME == "ssh_front_mhd":
+    distance.level = LEVEL
+selector = AnalogSelector(library, distance)
 
 # Loop Current fronts share a common datum (the library ocean mean) so the fixed
-# 0.17 m contour tracks the front's position, not the basin-scale sea-level offset.
-ref_mean = float(np.nanmean(lib.mean_surf[lib.ocean]))
+# contour tracks the front's position, not the basin-scale sea-level offset.
+ref_mean = float(np.nanmean(np.nanmean(library.pool("ssh").values, axis=0)[library.ocean]))
 
 # %% Roll out one forecast per usable window.
+metrics = scoring.build(SCORE_METRIC_NAMES, library, level=LEVEL, referenced=True)
+primary = metrics[-1]
+
 ends = ow.available_windows(swot_days, stride=OBS["stride"])
-windows, obs_days, results, selections, covers = [], [], [], [], []
+labels, per_window, selections, windows, covers = [], [], [], [], []
 skipped = {"no_window": 0, "no_truth": 0, "front_unobserved": []}
 
 for end in ends:
     vday = end + np.timedelta64(int(LEAD), "D")
-    g_end, g_valid = truth.field_on(end), truth.field_on(vday)
-    if g_end is None or g_valid is None:
+    present = source.truth_field(end, library)
+    if present is None or source.truth_field(vday, library) is None:
         skipped["no_truth"] += 1               # no dense truth at the window end or +LEAD
         continue
 
     window = ow.build_window(
-        source, end, lib,
+        source, end, library,
         n_days=OBS["n_days"], min_cells_per_day=OBS["min_cells_per_day"],
         require_days=OBS["require_days"],
         weights=OBS["weights"], halflife=OBS["halflife"])
@@ -175,31 +146,39 @@ for end in ends:
     # Only score days on which the window actually samples the Loop Current:
     # locate the front in the dense field at the window end and require the
     # window's union coverage to observe enough of it.
-    front = front_mask(g_end, level=LEVEL, ocean=lib.ocean, ref_mean=ref_mean)
+    front = front_mask(present, level=LEVEL, ocean=library.ocean, ref_mean=ref_mean)
     cover = front_coverage(front, window.coverage_mask)
     if cover < FRONT_COVER_MIN:
         skipped["front_unobserved"].append((str(end), cover))
         continue
 
     # 1. IDENTIFY analogs from the window, 2. FORECAST them, 3. SCORE vs dense truth.
-    selection = selector.select(window, lead=LEAD, k=K, min_sep=MIN_SEP)
-    ens = forecaster.forecast(selection, LEAD)
-    r = sa.evaluate(lib, selection, ens, g_valid, vday, persist_surf=g_end,
-                    lead=LEAD, lc_level=LEVEL)
+    selection = selector.select_window(window, k=K, buffer_days=MIN_SEP)
+    result = fc.rollout(library, selection, library.timestamp(end), [LEAD],
+                        variables=("ssh",), combiner=COMBINER)
+    skill = fc.score(result, metrics)
 
-    windows.append(window)
-    obs_days.append(str(end))
-    results.append(r)
+    scores = {}
+    for m in metrics:
+        per_member, ens_curve = skill[m.name]
+        persistence = m({"ssh": result.truth[LEAD]["ssh"].copy(data=present)},
+                        result.truth[LEAD], result.valid_times[LEAD])
+        scores[m.name] = dict(members=[c[0] for c in per_member],
+                              ensemble=ens_curve[0], persistence=persistence)
+
+    labels.append(str(end))
+    per_window.append(scores)
     selections.append(selection)
+    windows.append(window)
     covers.append(cover)
+    p = scores[primary.name]
     print(f"window end {str(end)} ({len(window)}d, {window.n_obs}sw, "
           f"LC {cover:.0%} observed) -> truth {str(vday)[:10]}: "
-          f"front MHD (km) best={np.nanmin(r['lc_mhd']):.0f} "
-          f"med={np.nanmedian(r['lc_mhd']):.0f} ens={r['lc_mhd_ens']:.0f} "
-          f"persist={r['lc_mhd_persist']:.0f}  [ACC best={np.nanmax(r['acc']):+.2f}]",
-          flush=True)
+          f"{primary.name} ({primary.unit}) best={np.nanmin(p['members']):.1f} "
+          f"med={np.nanmedian(p['members']):.1f} ens={p['ensemble']:.1f} "
+          f"persist={p['persistence']:.1f}", flush=True)
 
-print(f"\nUsed {len(obs_days)} windows "
+print(f"\nUsed {len(labels)} windows "
       f"(n_days={OBS['n_days']}, max_swaths/day={OBS['max_swaths_per_day']}, "
       f"K={K}, min_sep={MIN_SEP}, lead={LEAD}).")
 print(f"  skipped: {skipped['no_window']} without usable SWOT coverage, "
@@ -207,107 +186,47 @@ print(f"  skipped: {skipped['no_window']} without usable SWOT coverage, "
       f"{len(skipped['front_unobserved'])} with the Loop Current under-observed "
       f"(< {FRONT_COVER_MIN:.0%}).")
 
-if not results:
+if not per_window:
     raise SystemExit("No usable windows — loosen observation.min_cells_per_day or "
                      "verification.front_cover_min, or widen observation.n_days.")
 
-# %% Illustration for one window: which analogs it identified, and what they forecast.
-di = obs_days.index(DEMO_DAY) if DEMO_DAY in obs_days else int(np.argmax(covers))
-w0, T0, r0, sel0 = windows[di], obs_days[di], results[di], selections[di]
-og0, mk0 = w0.composite, w0.coverage_mask
+# %% -- Section 3: figures ---------------------------------------------------- #
+di = labels.index(DEMO_DAY) if DEMO_DAY in labels else int(np.argmax(covers))
+w0, T0, sel0 = windows[di], labels[di], selections[di]
 print(f"\nDemo window: {w0.describe()}  (Loop Current {covers[di]:.0%} observed)")
-print(f"  analogs: " + ", ".join(
-    f"{d}({x:.2f})" for d, x in zip(ow.selection_dates(lib, sel0), sel0.distances)))
+print("  analogs: " + ", ".join(f"{d}({x:.2f})"
+                                for d, x in zip(sel0.dates, sel0.distances)))
 
-viz.plot_swot_analogs(og0, mk0, lib, sel0.indices, sel0.distances, day, k=K_SHOW,
-                      outdir=FIG_DIR)
+plots.plot_observation_analogs(w0.composite, w0.coverage_mask, library, sel0,
+                               FIG_DIR, k=K_SHOW)
 
-# %% The analog grid: one row per member (state, then misfit), leads as columns,
-# ensemble and truth as the final rows, daily skill curves down the right.
+# The analog grid, evaluated daily so the curves are continuous even though the
+# map columns stay at the coarser map_leads.
 end0 = np.datetime64(T0)
-g_end0 = truth.field_on(end0)
-k_grid = min(K_SHOW, len(sel0), len(viz.ANALOG_COLORS))
-idx0 = sel0.indices[:k_grid]
-sel_max = int(sel0.indices.max())            # ensemble needs every member's future
-
-
-def ref(field):
-    """Absolute SSH on the datum the fixed contour assumes (see fronts.referenced)."""
-    return referenced(field, ocean=lib.ocean, ref_mean=ref_mean)
-
-
-def usable(lead):
-    """A lead is plottable only with dense truth and a future for every analog."""
-    return (sel_max + int(lead) < lib.n
-            and truth.field_on(end0 + np.timedelta64(int(lead), "D")) is not None)
-
-
-map_leads = [int(L) for L in MAP_LEADS if usable(L)]
-curve_leads = [L for L in range(0, CURVE_DAYS + 1) if usable(L)]
+curve_leads = [L for L in range(0, CURVE_DAYS + 1)
+               if library.covers(end0 + np.timedelta64(L, "D"))]
+map_leads = [int(L) for L in MAP_LEADS if L in curve_leads]
 if not map_leads:
     raise SystemExit(f"None of forecast.map_leads={MAP_LEADS} has dense truth at {T0}.")
 
-truth_states = [ref(truth.field_on(end0 + np.timedelta64(L, "D"))) for L in map_leads]
-states = [[ref(lib.state[i + L]) for L in map_leads] for i in idx0]
-states.append([ref(forecaster.forecast(sel0, L)) for L in map_leads])   # ensemble row
-states.append(truth_states)                                            # truth row
-init_states = ([ref(lib.state[i]) for i in idx0]
-               + [ref(forecaster.forecast(sel0, 0)), ref(g_end0)])
+demo = fc.rollout(library, sel0, library.timestamp(end0), curve_leads,
+                  variables=("ssh",), combiner=COMBINER)
+demo_skill = fc.score(demo, metrics)
+plots.plot_analog_grid("ssh", library, demo, demo_skill, metrics, map_leads, T0,
+                       DISTANCE_NAME, FIG_DIR, "analog_grid.png",
+                       contour_level=LEVEL)
 
-sel_dates = ow.selection_dates(lib, sel0)
-row_labels = ([f"analog {r + 1}\n{sel_dates[r]}" for r in range(k_grid)]
-              + [f"ensemble\nK = {len(sel0)}", f"GLORYS truth\n{T0}"])
+plots.plot_window_skill(labels, per_window, metrics, LEAD, FIG_DIR,
+                        "swot_window_skill.png")
 
-# Score every lead the same way the headline number is scored, so the curves and
-# the printed summary cannot drift apart.
-shape = (k_grid, len(curve_leads))
-acc_m, rmse_m, mhd_m = (np.full(shape, np.nan) for _ in range(3))
-acc_e, rmse_e, mhd_e = (np.full(len(curve_leads), np.nan) for _ in range(3))
-acc_p, rmse_p, mhd_p = (np.full(len(curve_leads), np.nan) for _ in range(3))
-for li, L in enumerate(curve_leads):
-    vd = end0 + np.timedelta64(L, "D")
-    rL = sa.evaluate(lib, sel0, forecaster.forecast(sel0, L), truth.field_on(vd), vd,
-                     persist_surf=g_end0, lead=L, lc_level=LEVEL)
-    acc_m[:, li], rmse_m[:, li], mhd_m[:, li] = (rL["acc"][:k_grid],
-                                                 rL["rmse"][:k_grid],
-                                                 rL["lc_mhd"][:k_grid])
-    acc_e[li], rmse_e[li], mhd_e[li] = rL["acc_ens"], rL["rmse_ens"], rL["lc_mhd_ens"]
-    acc_p[li], rmse_p[li], mhd_p[li] = (rL["acc_persist"], rL["rmse_persist"],
-                                        rL["lc_mhd_persist"])
-
-curves = {
-    "ACC": dict(members=acc_m, ens=acc_e, persist=acc_p, unit="correlation"),
-    "RMSE": dict(members=rmse_m, ens=rmse_e, persist=rmse_p, unit="m"),
-    "front MHD": dict(members=mhd_m, ens=mhd_e, persist=mhd_p, unit="km"),
-}
-viz.plot_analog_grid(og0, mk0, init_states, states, truth_states, map_leads,
-                     row_labels, curves, curve_leads, level=LEVEL, obs_day=T0,
-                     n_analogs=k_grid, fname="analog_grid.png", outdir=FIG_DIR)
-
-# %% Summary: Loop Current front skill (primary) + full-field ACC/RMSE (context).
-viz.plot_analog_glorys_lc_skill(obs_days, results, LEAD, outdir=FIG_DIR)
-viz.plot_analog_glorys_skill(obs_days, results, LEAD, outdir=FIG_DIR)
-
-lc_best = np.array([np.nanmin(r["lc_mhd"]) for r in results])
-lc_med = np.array([np.nanmedian(r["lc_mhd"]) for r in results])
-lc_ens = np.array([r["lc_mhd_ens"] for r in results])
-lc_per = np.array([r["lc_mhd_persist"] for r in results])
-acc_ens = np.array([r["acc_ens"] for r in results])
-acc_per = np.array([r["acc_persist"] for r in results])
-
-print(f"\nMean over {len(obs_days)} windows — Loop Current front MHD (km) "
-      f"@ lead {LEAD} (lower = better):")
-print(f"  best analog   = {np.nanmean(lc_best):5.1f}")
-print(f"  median analog = {np.nanmean(lc_med):5.1f}")
-print(f"  ensemble mean = {np.nanmean(lc_ens):5.1f}")
-print(f"  persistence   = {np.nanmean(lc_per):5.1f}")
-print(f"Full-field ACC @ lead {LEAD} (higher = better): "
-      f"ensemble {np.nanmean(acc_ens):+.2f}, persistence {np.nanmean(acc_per):+.2f}")
-verdict = "beats" if np.nanmean(lc_best) < np.nanmean(lc_per) else "loses to"
-print(f"VERDICT: the best SWOT-selected analog {verdict} dense persistence on the "
-      f"Loop Current front at {LEAD} days.")
+# %% Summary.
+print(f"\nMean over {len(labels)} windows @ lead {LEAD}:")
+for m in metrics:
+    best_fn = np.nanmax if m.higher_is_better else np.nanmin
+    best = np.nanmean([best_fn(w[m.name]["members"]) for w in per_window])
+    ens = np.nanmean([w[m.name]["ensemble"] for w in per_window])
+    per = np.nanmean([w[m.name]["persistence"] for w in per_window])
+    direction = "higher" if m.higher_is_better else "lower"
+    print(f"  {m.name:>16s} ({m.unit}, {direction} = better): "
+          f"best analog {best:7.3f} | ensemble {ens:7.3f} | persistence {per:7.3f}")
 print(f"Figures written to {FIG_DIR}/")
-
-plt.show()
-
-# %%

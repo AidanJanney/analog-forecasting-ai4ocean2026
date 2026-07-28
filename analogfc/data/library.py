@@ -69,3 +69,14 @@ class ModelLibrary:
         """Whether the full record covers `when` (a rollout ran off the end if not)."""
         t = self.fields.time.values
         return bool(t.min() <= np.datetime64(when) <= t.max())
+
+    def timestamp(self, date):
+        """The record's exact stamp for a calendar date, or None if absent.
+
+        GLORYS timestamps carry a 12:00 time of day, so a bare date parses to
+        midnight and misses on an exact ``.sel``. Every entry point that takes a
+        date from a config or a filename goes through here.
+        """
+        day = np.datetime64(str(date)[:10], "D")
+        hit = np.flatnonzero(self.fields.time.values.astype("datetime64[D]") == day)
+        return None if hit.size == 0 else self.fields.time.values[int(hit[0])]

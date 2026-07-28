@@ -38,3 +38,7 @@ forecast:
   length_days: 30
   lead_days: [0, 10, 20, 30]
   score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
+  # How the selected analogs become one forecast: ensemble_mean (plain
+  # mean), best_analog (the nearest one), or weighted_mean (Gaussian on
+  # distance).
+  combiner: ensemble_mean
