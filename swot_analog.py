@@ -161,8 +161,8 @@ def evaluate(library, analogs, ens_forecast, truth_surf, vday, persist_surf=None
     `persist_surf` is given, a dense persistence baseline. All fields are
     deseasonalized at `vday`. Skill: full-field ACC/RMSE and the Loop Current front
     MHD (km). Returns the dict the SWOT→GLORYS figures consume — including the truth
-    initial condition (``init``: `persist_surf` deseasonalized at the obs day) and
-    the extracted fronts.
+    initial condition (``init``: `persist_surf` deseasonalized at the obs day), the
+    ensemble anomaly and its selection weights, and the extracted fronts.
     """
     lib = library
     sel, dist = analogs.indices, analogs.distances
@@ -213,7 +213,8 @@ def evaluate(library, analogs, ens_forecast, truth_surf, vday, persist_surf=None
     lc_mhd_persist, persist_front = (_lc(persist_surf) if persist_surf is not None
                                      else (np.nan, np.empty((0, 2))))
 
-    return dict(sel=sel, dist=dist, fc_anoms=fc_anoms, truth=truth, init=init_anom,
+    return dict(sel=sel, dist=dist, weights=analogs.weights, fc_anoms=fc_anoms,
+                truth=truth, init=init_anom, ens_anom=ens_anom,
                 acc=acc, rmse=rmse, acc_ens=acc_ens, rmse_ens=rmse_ens,
                 acc_persist=acc_persist, rmse_persist=rmse_persist,
                 lc_mhd=lc_mhd, lc_mhd_ens=lc_mhd_ens, lc_mhd_persist=lc_mhd_persist,

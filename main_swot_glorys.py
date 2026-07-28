@@ -141,7 +141,9 @@ if results:
                                 r0["truth"], r0["acc"], LEAD, dist=r0["dist"], k_show=K_SHOW,
                                 fc_fronts=r0["fc_fronts"], truth_front=r0["truth_front"],
                                 lc_mhd=r0["lc_mhd"], init_anom=r0["init"],
-                                init_front=r0["persist_front"])
+                                init_front=r0["persist_front"], ens_anom=r0["ens_anom"],
+                                ens_front=r0["ens_front"], acc_ens=r0["acc_ens"],
+                                lc_mhd_ens=r0["lc_mhd_ens"], weights=r0["weights"])
 
 # %% Summary: Loop Current front skill (primary) + full-field ACC/RMSE (context).
 if results:

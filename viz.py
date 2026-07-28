@@ -344,27 +344,45 @@ def plot_analog_glorys_maps(lib, obs_day, obs_grid, mask, sel, day, fc_anoms,
                             truth_anom, accs, lead, dist=None, k_show=6,
                             fc_fronts=None, truth_front=None, lc_mhd=None,
                             init_anom=None, init_front=None,
+                            ens_anom=None, ens_front=None, acc_ens=None,
+                            lc_mhd_ens=None, weights=None,
                             fname="analog_glorys_maps.png", outdir=PLOTS):
-    """SWOT obs | analog | GLORYS init | +lead forecast | dense GLORYS truth.
+    """SWOT obs | GLORYS init | analog | +lead forecast | dense GLORYS truth.
 
-    Each row is one SWOT-selected (de-clustered) analog. The first column is the SWOT
-    swath that drove the selection (gridded, NaN off-swath, offset removed since ssha
-    and zos have different references) and the third is the dense GLORYS truth at the
-    *obs* day — the initial condition the forecast has to move away from — so each row
-    reads left-to-right as what was observed, what matched it, where the ocean actually
-    started, where the analog says it goes, and where it actually went. Titles carry the
-    analog date, the forecast's dense ACC and its Loop Current front error (MHD, km).
-    The Loop Current front is overlaid on the initial condition (orange), the forecast
-    (green) and the truth (black), with the truth front also drawn on each forecast
-    panel so the position error is visible. All model maps are deseasonalized (the
-    initial condition at the obs day, the rest at the verification day) and share a
-    diverging scale.
+    The first two columns are the shared setup for the whole figure — the SWOT swath
+    that drove the selection (gridded, NaN off-swath, offset removed since ssha and zos
+    have different references) and the dense GLORYS state on the same day, the initial
+    condition the forecast has to move away from, with the swath outline drawn on it so
+    it is clear which part of that state SWOT actually saw. They are the same on every
+    row, so they are drawn once on the top row and the panels below are left blank.
+
+    The remaining three columns are per-row: one SWOT-selected (de-clustered) analog,
+    that analog advanced `lead` days, and the shared dense GLORYS truth at obs + lead.
+    Titles carry the analog date, the forecast's dense ACC and its Loop Current front
+    error (MHD, km). The Loop Current front is overlaid on the initial condition
+    (orange), the forecast (green) and the truth (black), with the truth front also
+    drawn on each forecast panel so the position error is visible. All model maps are
+    deseasonalized (the initial condition at the obs day, the rest at the verification
+    day) and share a diverging scale.
+
+    If `ens_anom` is given, a final row holds the ensemble: the weighted composite of
+    *all* selected analogs at selection time (given `weights`, the selection weights
+    the forecast itself used) beside the ensemble forecast. Note the ensemble is built
+    from every selected analog, not just the `k_show` rows displayed above it.
     """
     k = min(k_show, len(sel))
     sel_fields = [lib.deseasonalize(lib.anom[i], lib.times[i]) for i in sel[:k]]
     fcs = fc_anoms[:k]
+    ens_row = ens_anom is not None
+    # Ensemble composite at selection time: the same weighted mean of the same analogs
+    # the forecast is built from, so the last row reads like the rows above it.
+    ens_sel = None
+    if ens_row and weights is not None and len(weights) == len(sel):
+        all_fields = [lib.deseasonalize(lib.anom[i], lib.times[i]) for i in sel]
+        ens_sel = np.tensordot(np.asarray(weights), np.array(all_fields), axes=1)
     pool = np.concatenate([truth_anom[np.isfinite(truth_anom)]]
                           + ([] if init_anom is None else [init_anom[np.isfinite(init_anom)]])
+                          + ([] if not ens_row else [ens_anom[np.isfinite(ens_anom)]])
                           + [f[np.isfinite(f)] for f in sel_fields + list(fcs)])
     vmax = float(np.nanpercentile(np.abs(pool), 98))
     kw = dict(origin="lower", cmap="RdBu_r", vmin=-vmax, vmax=vmax)
@@ -374,52 +392,86 @@ def plot_analog_glorys_maps(lib, obs_day, obs_grid, mask, sel, day, fc_anoms,
     # selection kernel is offset-invariant, so show the swath with its offset removed.
     obs_show = np.where(mask, obs_grid - np.nanmean(obs_grid[mask]), np.nan)
 
-    cols = ["swot", "analog", "init", "forecast", "truth"]
+    cols = ["swot", "init", "analog", "forecast", "truth"]
     if init_anom is None:
         cols.remove("init")
     c = {name: j for j, name in enumerate(cols)}
     nc = len(cols)
 
+    nr = k + int(ens_row)
     aspect_wh = truth_anom.shape[1] / truth_anom.shape[0]
     ph = 1.9
-    fig, ax = plt.subplots(k, nc, figsize=(nc * ph * aspect_wh + 1.2, k * ph + 1.2),
+    fig, ax = plt.subplots(nr, nc, figsize=(nc * ph * aspect_wh + 1.2, nr * ph + 1.2),
                            constrained_layout=True, squeeze=False)
     im = None
-    for r in range(k):
-        i = sel[r]
+
+    def forecast_panel(a, field, front, title, edge="#1a7d3c", lw=2):
+        """A forecast map with its Loop Current front (green) over the truth's (black)."""
+        art = a.imshow(field, **kw)
+        if front is not None:
+            fx, fy = _front_px(front, lib.lon, lib.lat)
+            a.plot(fx, fy, ".", ms=1.1, color="#127a2e")
+        a.plot(*tf_px, ".", ms=0.8, color="k", alpha=0.7)         # truth front
+        a.set_title(title, fontsize=8, weight="bold")
+        for s in a.spines.values():
+            s.set(color=edge, linewidth=lw)
+        return art
+
+    def truth_panel(a):
+        a.imshow(truth_anom, **kw)
+        a.plot(*tf_px, ".", ms=1.1, color="k")                    # Loop Current
+        a.set_title(f"GLORYS truth +{lead}d", fontsize=8)
+        for s in a.spines.values():
+            s.set(color="#b5651d", linewidth=2)
+
+    for r in range(nr):
+        # Shared setup columns: identical on every row, so draw them only once.
         a_obs = ax[r, c["swot"]]
-        a_obs.set_facecolor("#e8e8e8")                   # unobserved (off-swath) cells
-        a_obs.imshow(obs_show, **kw)
-        a_obs.set_title(f"SWOT obs {obs_day}", fontsize=8)
-        for s in a_obs.spines.values():
-            s.set(color="#2a6ebb", linewidth=2)
-        ax[r, c["analog"]].imshow(sel_fields[r], **kw)
-        ax[r, c["analog"]].contour(mask, levels=[0.5], colors="k", linewidths=0.4)
-        rr = "" if dist is None else f"  r={1 - dist[r]:.2f}"
-        ax[r, c["analog"]].set_title(f"analog {r + 1}: {day[i]}{rr}", fontsize=8)
+        if r == 0:
+            a_obs.set_facecolor("#e8e8e8")               # unobserved (off-swath) cells
+            a_obs.imshow(obs_show, **kw)
+            a_obs.set_title(f"SWOT obs {obs_day}", fontsize=8)
+            for s in a_obs.spines.values():
+                s.set(color="#2a6ebb", linewidth=2)
+        else:
+            a_obs.set_axis_off()
         if init_anom is not None:
             a_ic = ax[r, c["init"]]
-            a_ic.imshow(init_anom, **kw)
-            a_ic.plot(*if_px, ".", ms=1.1, color="#b5651d")       # initial LC front
-            a_ic.set_title(f"GLORYS init {obs_day}", fontsize=8)
-            for s in a_ic.spines.values():
-                s.set(color="#d9a05b", linewidth=2)
-        a_fc = ax[r, c["forecast"]]
-        im = a_fc.imshow(fcs[r], **kw)
-        if fc_fronts is not None:                       # forecast LC front (green)
-            fx, fy = _front_px(fc_fronts[r], lib.lon, lib.lat)
-            a_fc.plot(fx, fy, ".", ms=1.1, color="#127a2e")
-        a_fc.plot(*tf_px, ".", ms=0.8, color="k", alpha=0.7)      # truth front
-        lc = "" if lc_mhd is None else f"   LC={lc_mhd[r]:.0f}km"
-        a_fc.set_title(f"forecast +{lead}d   ACC={accs[r]:+.2f}{lc}",
-                       fontsize=8, weight="bold")
-        for s in a_fc.spines.values():
-            s.set(color="#1a7d3c", linewidth=2)
-        ax[r, c["truth"]].imshow(truth_anom, **kw)
-        ax[r, c["truth"]].plot(*tf_px, ".", ms=1.1, color="k")    # Loop Current
-        ax[r, c["truth"]].set_title(f"GLORYS truth +{lead}d", fontsize=8)
-        for s in ax[r, c["truth"]].spines.values():
-            s.set(color="#b5651d", linewidth=2)
+            if r == 0:
+                a_ic.imshow(init_anom, **kw)
+                # swath outline: which part of this state SWOT actually observed
+                a_ic.contour(mask, levels=[0.5], colors="#2a6ebb", linewidths=0.7)
+                a_ic.plot(*if_px, ".", ms=1.1, color="#b5651d")   # initial LC front
+                a_ic.set_title(f"GLORYS init {obs_day}", fontsize=8)
+                for s in a_ic.spines.values():
+                    s.set(color="#d9a05b", linewidth=2)
+            else:
+                a_ic.set_axis_off()
+
+        a_an, a_fc = ax[r, c["analog"]], ax[r, c["forecast"]]
+        if r < k:                                        # one selected analog per row
+            i = sel[r]
+            a_an.imshow(sel_fields[r], **kw)
+            a_an.contour(mask, levels=[0.5], colors="k", linewidths=0.4)
+            rr = "" if dist is None else f"  r={1 - dist[r]:.2f}"
+            a_an.set_title(f"analog {r + 1}: {day[i]}{rr}", fontsize=8)
+            lc = "" if lc_mhd is None else f"   LC={lc_mhd[r]:.0f}km"
+            im = forecast_panel(a_fc, fcs[r], None if fc_fronts is None else fc_fronts[r],
+                                f"forecast +{lead}d   ACC={accs[r]:+.2f}{lc}")
+        else:                                            # ensemble of ALL K analogs
+            if ens_sel is None:
+                a_an.set_axis_off()
+            else:
+                a_an.imshow(ens_sel, **kw)
+                a_an.contour(mask, levels=[0.5], colors="k", linewidths=0.4)
+                a_an.set_title(f"weighted mean of all {len(sel)} analogs", fontsize=8)
+                for s in a_an.spines.values():
+                    s.set(color="#4a4a4a", linewidth=1.6)
+            acc_s = "" if acc_ens is None else f"   ACC={acc_ens:+.2f}"
+            lc = "" if lc_mhd_ens is None else f"   LC={lc_mhd_ens:.0f}km"
+            forecast_panel(a_fc, ens_anom, ens_front,
+                           f"ENSEMBLE forecast +{lead}d{acc_s}{lc}", lw=3)
+        truth_panel(ax[r, c["truth"]])
     for a in ax.ravel():
         a.set_xticks([])
         a.set_yticks([])
