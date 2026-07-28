@@ -96,6 +96,10 @@ climatology:
   group: climday
   reduce_dims: []
 
+  # Area of the field used to RANK library days. Omit or null for the whole
+  # domain. Independent of forecast.region below, so a run can select on one
+  # area and verify on another.
+  region: null
 forecast:
   # Lead time in days at which the analogs are verified (the headline number).
   lead_days: 14
@@ -112,6 +116,9 @@ forecast:
   # best_analog (the nearest one), or weighted_mean (Gaussian on distance).
   combiner: ensemble_mean
 
+  # Area of the field used to SCORE the forecast. Omit or null for the whole
+  # domain. Independent of analogs.region.
+  region: null
 verification:
   # Minimum fraction of the Loop Current front the window must observe for the day
   # to be scored. A ~120 km swath spans ~15-20% of the front, so 0.20 is about one

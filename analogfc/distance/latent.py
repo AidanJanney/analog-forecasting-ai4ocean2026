@@ -30,7 +30,7 @@ class LatentDistance(ObsDistance):
         self.var = var
         self.encoder = encoder
 
-    def prepare(self, library):
+    def prepare(self, library, region_mask=None):
         raise NotImplementedError(
             "LatentDistance is a documented stub. Implement an encoder mapping the "
             "field to a latent vector, trained so current-field latent distance "

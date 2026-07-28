@@ -60,6 +60,10 @@ analogs:
   # standard 17 cm criterion (Leben 2005). Used by the MHD ranking only.
   ssh_contour_level: 0.17
 
+  # Area of the field used to RANK library days. Omit or null for the whole
+  # domain. Independent of forecast.region below, so a run can select on one
+  # area and verify on another.
+  region: null
 forecast:
   # How far the rollout runs, in days. Errors are evaluated every day out to
   # here. Unrelated to analogs.buffer_days, which only spaces the analogs apart.
@@ -80,3 +84,7 @@ forecast:
   # mean), best_analog (the nearest one), or weighted_mean (Gaussian on
   # distance).
   combiner: ensemble_mean
+
+  # Area of the field used to SCORE the forecast. Omit or null for the whole
+  # domain. Independent of analogs.region.
+  region: null

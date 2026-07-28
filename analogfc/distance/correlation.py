@@ -15,6 +15,7 @@ applied to it, which would make the two sides incomparable.
 
 import numpy as np
 
+from ..data import regions
 from .base import DISTANCES, ObsDistance, weighted_corr
 
 
@@ -32,8 +33,9 @@ class CorrelationDistance(ObsDistance):
     def __init__(self, var="ssh"):
         self.var = var
 
-    def prepare(self, library):
+    def prepare(self, library, region_mask=None):
         self.library = library
+        self.region_mask = region_mask
         self.anom = np.asarray(
             library.pool(self.var, self.representation).values, dtype=np.float32)
         self.ocean = library.ocean
@@ -44,8 +46,7 @@ class CorrelationDistance(ObsDistance):
     def distance(self, obs_grid, mask=None):
         field = np.asarray(obs_grid)
         valid = np.isfinite(field) & self.ocean
-        if mask is not None:
-            valid = valid & mask
+        valid = regions.combine(valid, regions.combine(mask, self.region_mask))
         o = field[valid].astype(np.float32)
         X = self.anom[:, valid]                       # (n, n_valid)
         w = self.w[valid].astype(np.float32)

@@ -15,6 +15,9 @@ observation source to match:
 
 Every spatial mean here is latitude-weighted, so a grid cell at 31 N does not
 count the same as one covering ~7% more area at 18 N.
+
+Ranking may be restricted to a sub-area with a region mask, independently of the
+area a forecast is later *scored* over — see :mod:`..data.regions`.
 """
 
 from abc import ABC, abstractmethod
@@ -33,9 +36,14 @@ class ObsDistance(ABC):
     var = "ssh"
     representation = "raw"
 
-    def prepare(self, library):
-        """Precompute the library-side representation. Returns self."""
+    def prepare(self, library, region_mask=None):
+        """Precompute the library-side representation. Returns self.
+
+        `region_mask` restricts ranking to a sub-area of the domain (see
+        :mod:`..data.regions`); None ranks over the whole thing.
+        """
         self.library = library
+        self.region_mask = region_mask
         return self
 
     @abstractmethod

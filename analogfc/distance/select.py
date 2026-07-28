@@ -77,11 +77,15 @@ class AnalogSelector:
     Holds the library and a prepared :class:`~.base.ObsDistance`. One selector
     serves every workflow, because the observation is always the same thing by
     the time it gets here: a grid plus a coverage mask on the model grid.
+
+    `region_mask` restricts ranking to a sub-area of the domain, independently of
+    the area the resulting forecast is scored over (see :mod:`..data.regions`).
     """
 
-    def __init__(self, library, distance):
+    def __init__(self, library, distance, region_mask=None):
         self.library = library
-        self.distance = distance.prepare(library)
+        self.region_mask = region_mask
+        self.distance = distance.prepare(library, region_mask=region_mask)
 
     def scores(self, obs_grid, mask=None):
         """One score per library day, as a DataArray indexed by time."""

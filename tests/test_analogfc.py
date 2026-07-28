@@ -21,9 +21,11 @@ from analogfc import mhd
 from analogfc.data import climatology, sources, windows as ow
 from analogfc.data.glorys import Field, FieldSet
 from analogfc.data.library import ModelLibrary
+from analogfc.data.regions import Region
 from analogfc.distance import DISTANCES, AnalogSelector, select_top_k
 from analogfc.forecast import COMBINERS, METRICS, rollout as fc, score as scoring
-from analogfc.fronts import (front_edt, front_mask, front_mhd_km, grid_spacing_km)
+from analogfc.fronts import (FrontConvention, front_edt, front_mask,
+                             front_mhd_km, grid_spacing_km)
 from analogfc.registry import Registry
 
 CASES = []
@@ -644,6 +646,162 @@ def test_front_score_is_in_km_on_the_library_grid():
         assert abs(d - dlat_km) < 1e-6, f"{name}: one-cell shift scored {d}, not {dlat_km}"
 
 
+# --------------------------------------------------------------------------- #
+# Separate selection and scoring regions.
+# --------------------------------------------------------------------------- #
+@case
+def test_region_defaults_to_the_whole_domain():
+    """Omitting a region must change nothing — every earlier run relies on it."""
+    assert Region.from_config(None).is_whole
+    assert Region.from_config({}).is_whole
+    assert Region().label == "whole domain"
+
+    lib = synthetic_library()
+    for metric_name in ("ssh_rmsd", "ssh_front_mhd"):
+        plain = AnalogSelector(lib, DISTANCES.create(metric_name))
+        explicit = AnalogSelector(lib, DISTANCES.create(metric_name), region_mask=None)
+        obs = lib.at("ssh", lib.times[120],
+                     DISTANCES.create(metric_name).representation).values
+        assert np.allclose(plain.scores(obs).values, explicit.scores(obs).values,
+                           equal_nan=True), metric_name
+
+
+@case
+def test_region_mask_equals_cropping_the_data():
+    """A region applied as a mask must give exactly what loading that box gives.
+
+    This is the assumption the whole feature rests on: one FieldSet is loaded and
+    each part of the pipeline masks it, rather than loading the data twice. If
+    masking and cropping disagreed, a regional score would silently not be the
+    score over that region.
+    """
+    cropped = synthetic_library(domain=CENTRAL_DOMAIN)
+    full = synthetic_library(domain=FULL_DOMAIN)
+    region = Region(**{k: v for k, v in CENTRAL_DOMAIN.items() if v is not None})
+    mask = region.mask(full)
+
+    when = full.times[300]
+    target = full.fields["ssh"].raw.sel(time=TARGET_DATE).time.values[0]
+
+    for metric_name in ("ssh_rmsd", "sst_rmsd", "ssh_front_mhd", "correlation"):
+        distance = DISTANCES.create(metric_name)
+        crop_sel = AnalogSelector(cropped, DISTANCES.create(metric_name))
+        mask_sel = AnalogSelector(full, DISTANCES.create(metric_name), region_mask=mask)
+
+        crop_obs = cropped.at(distance.var, target, distance.representation).values
+        full_obs = full.at(distance.var, target, distance.representation).values
+        crop_scores = crop_sel.scores(crop_obs).values
+        mask_scores = mask_sel.scores(full_obs).values
+        assert np.allclose(crop_scores, mask_scores, equal_nan=True, atol=1e-9), (
+            f"{metric_name}: masking and cropping disagree, "
+            f"max |diff| = {np.nanmax(np.abs(crop_scores - mask_scores))}")
+
+    # ... and the same for every score metric.
+    crop_metrics = scoring.build(SCORE_METRICS, cropped, level=0.17)
+    mask_metrics = scoring.build(SCORE_METRICS, full, level=0.17, region_mask=mask)
+    crop_fields = {v: cropped.at(v, when) for v in ("sst", "ssh")}
+    full_fields = {v: full.at(v, when) for v in ("sst", "ssh")}
+    later = full.times[330]
+    crop_truth = {v: cropped.at(v, later) for v in ("sst", "ssh")}
+    full_truth = {v: full.at(v, later) for v in ("sst", "ssh")}
+    for cm, mm in zip(crop_metrics, mask_metrics):
+        a = cm(crop_fields, crop_truth, later)
+        b = mm(full_fields, full_truth, later)
+        assert np.isclose(a, b, equal_nan=True, atol=1e-9), \
+            f"{cm.name}: cropped {a} vs masked {b}"
+
+
+@case
+def test_selection_and_scoring_regions_are_independent():
+    """The point of the feature: rank on one area, verify on another."""
+    lib = synthetic_library()
+    central = Region(min_longitude=-92.5, max_longitude=-80.0)
+    west = Region(min_longitude=-98.0, max_longitude=-92.5)
+    central_mask, west_mask = central.mask(lib), west.mask(lib)
+    target = lib.fields["ssh"].raw.sel(time=TARGET_DATE).time.values[0]
+
+    def run(select_mask, score_mask):
+        distance = DISTANCES.create("ssh_rmsd")
+        selector = AnalogSelector(lib, distance, region_mask=select_mask)
+        obs = lib.at(distance.var, target, distance.representation).values
+        analogs = selector.select(obs, k=K, buffer_days=BUFFER_DAYS)
+        metrics = scoring.build(["ssh_rmse"], lib, region_mask=score_mask)
+        result = fc.rollout(lib, analogs, target, [0, 10], variables=("ssh",))
+        return analogs, fc.score(result, metrics)["ssh_rmse"][1]
+
+    central_central, score_cc = run(central_mask, central_mask)
+    central_west, score_cw = run(central_mask, west_mask)
+    west_central, score_wc = run(west_mask, central_mask)
+
+    # Same selection region, different scoring region -> same analogs, different scores.
+    assert central_central.dates == central_west.dates
+    assert not np.allclose(score_cc, score_cw), \
+        "the scoring region made no difference to the scores"
+
+    # Same scoring region, different selection region -> different analogs.
+    assert central_central.dates != west_central.dates, \
+        "the selection region made no difference to the analogs"
+
+
+@case
+def test_front_convention_is_shared_by_selection_and_scoring():
+    """Selection and scoring must contour the same front, by construction.
+
+    They used to build the level/datum/segment bundle separately, which meant a
+    run could rank days on one front and measure error against another with
+    nothing failing.
+    """
+    lib = synthetic_library()
+    region_mask = Region(min_longitude=-92.5, max_longitude=-80.0).mask(lib)
+
+    distance = DISTANCES.create("ssh_front_mhd", referenced=True)
+    AnalogSelector(lib, distance, region_mask=region_mask)
+    metric = scoring.build(["ssh_front_mhd"], lib, level=0.17, referenced=True,
+                           region_mask=region_mask)[0]
+
+    a, b = distance.front, metric.front
+    assert a.level == b.level and a.main_only == b.main_only
+    assert a.sampling == b.sampling
+    assert a.ref_mean == b.ref_mean, "selection and scoring disagree on the datum"
+
+    field = lib.at("ssh", lib.times[250]).values
+    assert np.array_equal(a.mask(field), b.mask(field)), \
+        "selection and scoring extract different fronts from the same field"
+
+
+@case
+def test_regional_front_is_referenced_to_its_own_region():
+    """A regional datum must come from the region, not from a basin mean."""
+    lib = synthetic_library()
+    region_mask = Region(min_longitude=-92.5, max_longitude=-80.0).mask(lib)
+    whole = FrontConvention.from_library(lib, referenced=True)
+    regional = FrontConvention.from_library(lib, referenced=True,
+                                            region_mask=region_mask)
+    assert whole.ref_mean != regional.ref_mean
+    # And the regional front must not stray outside its region.
+    front = regional.mask(lib.at("ssh", lib.times[250]).values)
+    assert not front[~region_mask].any()
+
+
+@case
+def test_region_outside_the_domain_fails_loudly():
+    """An empty region would make every score NaN with nothing to say why."""
+    lib = synthetic_library()
+    try:
+        Region(min_longitude=10.0, max_longitude=20.0).mask(lib)
+    except ValueError as e:
+        assert "selects no cells" in str(e) and "Widen `domain`" in str(e)
+    else:
+        raise AssertionError("a region outside the domain must raise")
+
+    try:
+        Region.from_config({"min_lon": -92.5})
+    except ValueError as e:
+        assert "unknown region bound" in str(e)
+    else:
+        raise AssertionError("a misspelt bound must raise")
+
+
 @case
 def test_selection_rules_disagree_about_which_days_are_analogs():
     """The two scenarios must actually be different experiments.
@@ -751,6 +909,39 @@ def test_every_config_names_registered_options():
             assert metric in METRICS, f"{name}: score metric {metric!r}"
         if "combiner" in forecast:
             assert forecast["combiner"] in COMBINERS, f"{name}: {forecast['combiner']!r}"
+        # Both regions must parse, and must sit inside the configured domain.
+        domain = Region.from_config({k: v for k, v in config["domain"].items()})
+        for where, section in (("analogs", analogs), ("forecast", forecast)):
+            region = Region.from_config(section.get("region"))
+            if region.is_whole or domain.is_whole:
+                continue
+            assert region.min_longitude is None or domain.min_longitude is None \
+                or region.min_longitude >= domain.min_longitude, \
+                f"{name}: {where}.region starts west of the loaded domain"
+            assert region.max_longitude is None or domain.max_longitude is None \
+                or region.max_longitude <= domain.max_longitude, \
+                f"{name}: {where}.region ends east of the loaded domain"
+
+
+@case
+def test_the_split_region_config_actually_splits():
+    """config/glorys_select_central_score_full.yaml must do what its name says."""
+    import yaml
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "config", "glorys_select_central_score_full.yaml")
+    with open(path) as fh:
+        config = yaml.safe_load(fh)
+
+    selection = Region.from_config(config["analogs"]["region"])
+    scoring_region = Region.from_config(config["forecast"]["region"])
+    assert not selection.is_whole, "the selection region is not restricted"
+    assert scoring_region.is_whole, "the scoring region should be the whole domain"
+    assert selection != scoring_region
+    # The domain must be left whole, or the scoring region would be silently
+    # narrowed by the load bounds and the config would not ask its question.
+    assert all(v is None for v in config["domain"].values()), \
+        "the domain must stay whole for the scoring region to mean the whole basin"
 
 
 def main():

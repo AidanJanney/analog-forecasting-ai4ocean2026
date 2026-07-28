@@ -149,3 +149,114 @@ def front_coverage(mask, observed):
     """
     n = int(mask.sum())
     return float((mask & observed).sum()) / n if n else 0.0
+
+
+class FrontConvention:
+    """Everything that defines *which* front is being measured, in one object.
+
+    A front is not just a contour level: it is the level, the datum the level is
+    taken against, whether detached segments count, the area being looked at, and
+    the physical cell size that turns the result into km. Selection and scoring
+    must agree on all five, or a run ranks library days by one front and measures
+    its error against a different one — which produces no error, just numbers that
+    quietly mean two things.
+
+    So the bundle lives here, built once from the library and handed to both the
+    :class:`~.distance.front_mhd.FrontMHD` distance and the
+    :class:`~.forecast.score.FrontMHDError` metric.
+
+    Parameters
+    ----------
+    sampling : (dlat_km, dlon_km)
+        Physical cell size, so distances come out in km.
+    level : float
+        The SSH contour defining the front, in metres.
+    ocean : (nlat, nlon) bool or None
+        Land mask. Needed only when `ref_mean` is set.
+    ref_mean : float or None
+        Shift each field's mean over the scored cells to this datum before
+        contouring, so the fixed level tracks the front's *position* rather than a
+        basin-scale sea-level offset. None contours fields as they are, which is
+        right when both sides come from the same reanalysis.
+    main_only : bool
+        Keep only the largest connected segment.
+    region_mask : (nlat, nlon) bool or None
+        Restrict the front to a sub-area. Cells outside it are excluded from the
+        field before contouring, so they can neither carry front cells nor
+        influence the datum.
+    """
+
+    def __init__(self, sampling, level=LEVEL, ocean=None, ref_mean=None,
+                 main_only=False, region_mask=None):
+        self.sampling = sampling
+        self.level = level
+        self.ocean = ocean
+        self.ref_mean = ref_mean
+        self.main_only = main_only
+        self.region_mask = region_mask
+
+    @classmethod
+    def from_library(cls, library, level=LEVEL, referenced=False, main_only=False,
+                     region_mask=None, var=None):
+        """Build for a library, computing the datum from it when `referenced`.
+
+        The datum is the mean over the cells actually being contoured — the ocean
+        within the region — so a regional front is referenced to that region and
+        not to a basin mean it never looks at.
+        """
+        ocean = library.ocean
+        ref_mean = None
+        if referenced:
+            scored = ocean if region_mask is None else (ocean & region_mask)
+            pool = library.pool(var or library.var).values
+            ref_mean = float(np.nanmean(np.nanmean(pool, axis=0)[scored]))
+        return cls(library.sampling, level=level, ocean=ocean, ref_mean=ref_mean,
+                   main_only=main_only, region_mask=region_mask)
+
+    def _restrict(self, field):
+        """Blank out everything outside the region.
+
+        NaN rather than a separate mask argument: `front_mask` already treats a
+        non-finite cell as neither inside the contour nor water below it, which is
+        exactly how a cell outside the region should behave — the same as cropping
+        the array to the region would make its edge behave.
+        """
+        f = np.asarray(field, dtype=float)
+        if f.ndim != 2:
+            f = f[0]
+        if self.region_mask is None:
+            return f
+        return np.where(self.region_mask, f, np.nan)
+
+    def mask(self, field):
+        """The front of one field, as a boolean grid mask."""
+        return front_mask(self._restrict(field), level=self.level, ocean=self._ocean(),
+                          ref_mean=self.ref_mean, main_only=self.main_only)
+
+    def _ocean(self):
+        if self.ocean is None or self.region_mask is None:
+            return self.ocean
+        return self.ocean & self.region_mask
+
+    def masks(self, states):
+        """Front masks for a (time, nlat, nlon) array or DataArray."""
+        arr = states.values if hasattr(states, "values") else np.asarray(states)
+        return [self.mask(arr[t]) for t in range(arr.shape[0])]
+
+    def edt(self, mask):
+        """Distance (km) from every cell to the nearest front cell of `mask`."""
+        return front_edt(mask, self.sampling)
+
+    def distance(self, mask_a, mask_b, edt_a=None, edt_b=None, empty=np.nan):
+        """Front displacement in km between two front masks."""
+        return front_mhd_km(mask_a, mask_b, self.sampling, edt_a=edt_a, edt_b=edt_b,
+                            empty=empty)
+
+    def describe(self):
+        bits = [f"{self.level:g} m contour"]
+        bits.append("referenced" if self.ref_mean is not None else "unreferenced")
+        if self.main_only:
+            bits.append("largest segment only")
+        if self.region_mask is not None:
+            bits.append("regional")
+        return ", ".join(bits)

@@ -12,14 +12,17 @@ area average of the field rather than an average over array elements.
 
 Scoring is a different seam from selection. How library days are *ranked* lives
 behind :mod:`..distance`; this module only judges the result, and a run normally
-scores by several metrics whichever one did the ranking.
+scores by several metrics whichever one did the ranking. The *area* is a separate
+seam too: metrics take their own :mod:`..data.regions` region, so a forecast can
+be selected on one part of the field and verified on another.
 """
 
 from abc import ABC, abstractmethod
 
 import numpy as np
 
-from ..fronts import LEVEL, front_mask, front_mhd_km
+from ..data import regions
+from ..fronts import LEVEL, FrontConvention
 from ..registry import Registry
 
 METRICS = Registry("score metric")
@@ -44,16 +47,17 @@ def _values(field):
 class WeightedRMSE(ErrorMetric):
     """Latitude-weighted root-mean-square error, in the field's own units."""
 
-    def __init__(self, var, library):
+    def __init__(self, var, library, region_mask=None):
         self.var = var
         self.name = f"{var}_rmse"
         self.unit = library.fields[var].unit
         self.w = _values(library.weights)
+        self.region_mask = region_mask
 
     def __call__(self, forecast, truth, valid_time=None):
         diff = _values(forecast[self.var]) - _values(truth[self.var])
         w = np.broadcast_to(self.w, diff.shape)
-        ok = np.isfinite(diff)
+        ok = regions.combine(np.isfinite(diff), self.region_mask)
         total = w[ok].sum()
         if total <= 0:
             return np.nan
@@ -75,18 +79,19 @@ class AnomalyCorrelation(ErrorMetric):
     higher_is_better = True
     unit = "correlation"
 
-    def __init__(self, var, library):
+    def __init__(self, var, library, region_mask=None):
         self.var = var
         self.name = f"{var}_acc"
         self.field = library.fields[var]
         self.w = _values(library.weights)
+        self.region_mask = region_mask
 
     def __call__(self, forecast, truth, valid_time=None):
         clim = _values(self.field.climatology_at(valid_time))
         f = _values(forecast[self.var]) - clim
         o = _values(truth[self.var]) - clim
         w = np.broadcast_to(self.w, f.shape)
-        ok = np.isfinite(f) & np.isfinite(o)
+        ok = regions.combine(np.isfinite(f) & np.isfinite(o), self.region_mask)
         f, o, w = f[ok], o[ok], w[ok]
         denominator = np.sqrt((w * f**2).sum() * (w * o**2).sum())
         return float((w * f * o).sum() / denominator) if denominator > 0 else np.nan
@@ -105,47 +110,44 @@ class FrontMHDError(ErrorMetric):
     name = "ssh_front_mhd"
     unit = "km"
 
-    def __init__(self, var, library, level=LEVEL, referenced=False, main_only=False):
+    def __init__(self, var, library, level=LEVEL, referenced=False, main_only=False,
+                 region_mask=None):
         self.var = var
-        self.sampling = library.sampling
-        self.level = level
-        self.main_only = main_only
-        self.kwargs = dict(level=level, main_only=main_only)
-        if referenced:
-            pool = library.pool(var).values
-            ref_mean = float(np.nanmean(np.nanmean(pool, axis=0)[library.ocean]))
-            self.kwargs.update(ocean=library.ocean, ref_mean=ref_mean)
+        self.front = FrontConvention.from_library(
+            library, level=level, referenced=referenced, main_only=main_only,
+            region_mask=region_mask, var=var)
+        self.sampling = self.front.sampling
 
     def __call__(self, forecast, truth, valid_time=None):
-        return front_mhd_km(front_mask(_values(forecast[self.var]), **self.kwargs),
-                            front_mask(_values(truth[self.var]), **self.kwargs),
-                            self.sampling)
+        return self.front.distance(self.front.mask(_values(forecast[self.var])),
+                                   self.front.mask(_values(truth[self.var])))
 
 
 @METRICS.register("sst_rmse")
-def _sst_rmse(library, **kw):
-    return WeightedRMSE("sst", library)
+def _sst_rmse(library, region_mask=None, **kw):
+    return WeightedRMSE("sst", library, region_mask=region_mask)
 
 
 @METRICS.register("ssh_rmse")
-def _ssh_rmse(library, **kw):
-    return WeightedRMSE("ssh", library)
+def _ssh_rmse(library, region_mask=None, **kw):
+    return WeightedRMSE("ssh", library, region_mask=region_mask)
 
 
 @METRICS.register("sst_acc")
-def _sst_acc(library, **kw):
-    return AnomalyCorrelation("sst", library)
+def _sst_acc(library, region_mask=None, **kw):
+    return AnomalyCorrelation("sst", library, region_mask=region_mask)
 
 
 @METRICS.register("ssh_acc")
-def _ssh_acc(library, **kw):
-    return AnomalyCorrelation("ssh", library)
+def _ssh_acc(library, region_mask=None, **kw):
+    return AnomalyCorrelation("ssh", library, region_mask=region_mask)
 
 
 @METRICS.register("ssh_front_mhd")
-def _ssh_front_mhd(library, level=LEVEL, referenced=False, main_only=False, **kw):
+def _ssh_front_mhd(library, level=LEVEL, referenced=False, main_only=False,
+                   region_mask=None, **kw):
     return FrontMHDError("ssh", library, level=level, referenced=referenced,
-                         main_only=main_only)
+                         main_only=main_only, region_mask=region_mask)
 
 
 def build(names, library, **kwargs):

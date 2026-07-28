@@ -35,9 +35,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from analogfc import config as cfg
 from analogfc.data import glorys, sources, swot, windows as ow
 from analogfc.data.library import ModelLibrary
+from analogfc.data.regions import Region
 from analogfc.distance import DISTANCES, AnalogSelector
 from analogfc.forecast import plots, rollout as fc, score as scoring
-from analogfc.fronts import front_coverage, front_mask
+from analogfc.fronts import front_coverage
 
 config = cfg.load("config/swot_glorys.yaml", "SWOT-to-GLORYS analog forecasting.")
 
@@ -58,6 +59,8 @@ CURVE_DAYS = config["forecast"]["curve_days"]
 SCORE_METRIC_NAMES = config["forecast"].get(
     "score_metrics", ["ssh_rmse", "ssh_acc", "ssh_front_mhd"])
 COMBINER = config["forecast"].get("combiner", "ensemble_mean")
+SELECTION_REGION = Region.from_config(config["analogs"].get("region"))
+SCORING_REGION = Region.from_config(config["forecast"].get("region"))
 FRONT_COVER_MIN = config["verification"]["front_cover_min"]
 LEVEL = config["verification"]["ssh_contour_level"]
 K_SHOW = config["figures"]["k_show"]
@@ -110,17 +113,24 @@ source = sources.SOURCES.create("swot", swaths_for=swaths_for, truth_library=tru
                                 max_swaths_per_day=OBS["max_swaths_per_day"])
 
 # %% -- Section 2: identifying analogs ---------------------------------------- #
+selection_mask = None if SELECTION_REGION.is_whole else SELECTION_REGION.mask(library)
+scoring_mask = None if SCORING_REGION.is_whole else SCORING_REGION.mask(library)
+print(f"Select on: {SELECTION_REGION.describe(library)}")
+print(f"Score on:  {SCORING_REGION.describe(library)}")
+
 distance = DISTANCES.create(DISTANCE_NAME)
 if DISTANCE_NAME == "ssh_front_mhd":
     distance.level = LEVEL
-selector = AnalogSelector(library, distance)
-
-# Loop Current fronts share a common datum (the library ocean mean) so the fixed
-# contour tracks the front's position, not the basin-scale sea-level offset.
-ref_mean = float(np.nanmean(np.nanmean(library.pool("ssh").values, axis=0)[library.ocean]))
+selector = AnalogSelector(library, distance, region_mask=selection_mask)
 
 # %% Roll out one forecast per usable window.
-metrics = scoring.build(SCORE_METRIC_NAMES, library, level=LEVEL, referenced=True)
+metrics = scoring.build(SCORE_METRIC_NAMES, library, level=LEVEL, referenced=True,
+                        region_mask=scoring_mask)
+
+# Fronts are referenced to a common datum across the two eras, so the fixed
+# contour tracks the front's position and not the basin-scale sea-level offset.
+# The coverage check below must use the same convention the metric does.
+front_convention = next(m for m in metrics if m.name == "ssh_front_mhd").front
 primary = metrics[-1]
 
 ends = ow.available_windows(swot_days, stride=OBS["stride"])
@@ -146,7 +156,7 @@ for end in ends:
     # Only score days on which the window actually samples the Loop Current:
     # locate the front in the dense field at the window end and require the
     # window's union coverage to observe enough of it.
-    front = front_mask(present, level=LEVEL, ocean=library.ocean, ref_mean=ref_mean)
+    front = front_convention.mask(present)
     cover = front_coverage(front, window.coverage_mask)
     if cover < FRONT_COVER_MIN:
         skipped["front_unobserved"].append((str(end), cover))

@@ -49,8 +49,16 @@ analogs:
   # the level has to be defined.
   ssh_contour_level: 0.17
 
+  # Area of the field used to RANK library days. Omit or null for the whole
+  # domain. Independent of forecast.region below, so a run can select on one
+  # area and verify on another.
+  region: null
 forecast:
   length_days: 30
   lead_days: [0, 10, 20, 30]
   score_metrics: [sst_rmse, ssh_rmse, sst_acc, ssh_acc, ssh_front_mhd]
   combiner: ensemble_mean
+
+  # Area of the field used to SCORE the forecast. Omit or null for the whole
+  # domain. Independent of analogs.region.
+  region: null

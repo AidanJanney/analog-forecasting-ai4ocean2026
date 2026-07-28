@@ -152,6 +152,51 @@ cell size, which also corrects the grid's anisotropy (a degree of longitude at
 | `referenced` | Shift each field's ocean mean to a common datum before contouring, so the fixed level tracks the front's *position* rather than a basin-scale sea-level offset. Off within one reanalysis; on when comparing across datasets or eras. |
 | `main_only` | Keep only the largest connected segment — the Loop Current filament itself, not detached rings that also cross the level. Unstable where the domain's eastern cut clips the contour, so it is off by default. |
 
+### Selection and scoring regions
+
+`domain` bounds what is **loaded**. Within it, selection and scoring each take
+their own **region**, so a run can rank library days on one area and verify on
+another:
+
+```yaml
+domain:                      # what is loaded; regions are subsets of this
+  min_longitude: null        # null = no bound
+  ...
+
+analogs:
+  selection_metric: ssh_front_mhd
+  region:                    # rank on the central Gulf, where the front metric works
+    min_longitude: -92.5
+    max_longitude: -80.0
+
+forecast:
+  region: null               # but score over the whole basin
+```
+
+Omitted or `null` means the whole domain, which is what every run did before
+these existed. The question the split lets you ask: *if analogs are chosen purely
+on Loop Current front position, how good is the forecast everywhere else?* A
+selection that scores well only on its own region has found a local match, not a
+circulation analogue. `config/glorys_select_central_score_full.yaml` is that run.
+
+A region is applied as a **mask**, so one loaded `FieldSet` serves every region —
+the data is not read twice. That is exactly equivalent to loading the smaller box:
+selecting via `analogs.region` on the full domain reproduces the cropped-domain
+run's distances bit for bit, and `tests/test_analogfc.py` pins the equivalence for
+every distance and every metric.
+
+Not to be confused with `ObsWindow`, which is a *temporal* run of consecutive
+observation days. Regions are purely spatial.
+
+### One front definition, shared
+
+`fronts.FrontConvention` owns everything that decides *which* front is being
+measured — level, datum, whether detached segments count, the region, and the
+cell size that makes the answer km. Selection and scoring are handed the same
+object rather than each rebuilding it, because if they disagreed a run would rank
+library days by one front and measure its error against another, and nothing
+would fail — the numbers would just quietly mean two different things.
+
 ### Latitude weighting
 
 Every spatial mean — the RMSD selections, RMSE, ACC — is weighted by
@@ -176,25 +221,7 @@ conda run -n data-access-ai4ocean2026 python -m ipykernel install --user --name 
 
 Both routes produce one Zarr store per year, named `glorys_gom_<year>_subset.zarr`.
 
-### On Casper: subset the local mirror
-
-`subset_glorys.py` reads the GDEX GLORYS mirror at `/gdex/data/d010049`. No
-credentials required. Edit the region, depth range, and variables at the top of
-the file.
-
-Single year:
-
-```bash
-python subset_glorys.py 2004
-```
-
-All years, one job per year:
-
-```bash
-qsub submit_subset.pbs
-```
-
-### Off Casper: download from Copernicus Marine
+### Download from Copernicus Marine
 
 Requires a free Copernicus Marine account. Authenticate once:
 
@@ -223,23 +250,6 @@ python download_glorys.py rechunk data/glorys_gom_1993.nc glorys_gom_1993_subset
 python runs/glorys_analog.py                                 # config/analog_forecast.yaml
 python runs/glorys_analog.py --config config/smoke_test.yaml
 ```
-
-On Casper:
-
-```bash
-qsub submit_analog_forecast.pbs
-qsub -v CONFIG=config/smoke_test.yaml submit_analog_forecast.pbs
-```
-
-The full 33-year record peaks near 18 GB. Interactive sessions default to 10 GB;
-request more before running it by hand:
-
-```bash
-qsub -I -A P93300012 -q casper -l select=1:ncpus=8:mem=128GB -l walltime=06:00:00
-```
-
-Both drivers are `# %%` cell scripts and also run cell by cell in VS Code or
-Jupyter.
 
 ### Output
 
