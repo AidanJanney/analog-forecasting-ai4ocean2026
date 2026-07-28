@@ -46,6 +46,40 @@ The effect on the six-year smoke test is small and in the expected direction:
 | `ssh_rmsd` / `sst_rmsd` selection | same analogs, scores shifted in the 4th decimal; one `sst_rmsd` analog moved by a day (1995-09-23 → 1995-09-22) |
 | RMSE / ACC scores | ~0.5% |
 
+### 2026-07-28 — first real SWOT -> GLORYS run
+
+87 Expert-D granules for 2023-11-01..2023-12-15 (2.8 GB, reduced to 5.6 MB of
+in-box points). 21 usable windows at lead 14, from 45 observed days: 8 dropped for
+too little SWOT coverage, 16 because the window saw under 20% of the Loop Current
+front.
+
+| metric | best analog | ensemble | persistence |
+|---|---|---|---|
+| front MHD (km) | 29.5 | 43.0 | **22.1** |
+| ACC | 0.522 | 0.377 | **0.887** |
+| RMSE (m) | 0.145 | 0.150 | **0.081** |
+
+**Persistence wins on all three.** What this does not establish: the sample is 21
+windows inside a single 45-day stretch of one season, and 14-day persistence in a
+quiescent Loop Current period is a strong baseline — the front barely moved. It is
+a check that the pipeline runs and produces defensible numbers, not a verdict on
+the method. A fair test needs the full 2023-2025 record (~1800 granules, ~55 GB)
+so the sample spans eddy-shedding events, where persistence should degrade sharply
+and an analog has something to beat it with.
+
+Two things in the numbers are worth acting on:
+
+* **The ensemble is worse than the best analog on front MHD** (43.0 vs 29.5) while
+  being about equal on RMSE. This is the blurring already predicted in the
+  `best_analog` combiner's docstring: averaging analogs whose fronts sit in
+  different places produces a broad gradient that is nowhere, which reads fine to
+  RMSE and badly to a front metric. Worth running `combiner: best_analog` for
+  frontal targets.
+* **One-day windows produce ensemble blow-ups** — 163.7 km and 155.4 km, both from
+  the only two windows with a single observed day. With one swath the selection is
+  weakly constrained and the K analogs disagree wildly. Raising
+  `observation.require_days` to 2 would drop them.
+
 ### Earlier
 
 The work used to live in one notebook, `download_glorys.ipynb`, whose second half
