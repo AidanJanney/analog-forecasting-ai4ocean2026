@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import yaml
-from scipy.ndimage import distance_transform_edt
+
+from fronts import front_edt, front_mask, front_mhd_km, grid_spacing_km
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, "config", "analog_forecast.yaml")
@@ -271,40 +272,11 @@ def select_top_k_buffer(data, rmsd, k=K, buffer = 14):
 
     return data.sel(time=selected_dates)
 
-def front_mask(ssh_grid, level=SSH_CONTOUR_LEVEL):
-    """
-    Boolean mask of the Loop Current front: the SSH contour at `level`, following
-    the standard 17 cm criterion (Leben 2005).
-
-    Returns the inside edge of the region at or above `level` — cells above it
-    that are 4-adjacent to water below it. Requiring the neighbour to be water
-    keeps coastlines out of the mask, which would otherwise trace every shore
-    where high SSH meets land.
-    """
-    inside = np.nan_to_num(ssh_grid, nan=-np.inf) >= level
-    water_below = ~inside & ~np.isnan(ssh_grid)
-
-    neighbour_below = np.zeros_like(inside)
-    neighbour_below[1:, :] |= water_below[:-1, :]
-    neighbour_below[:-1, :] |= water_below[1:, :]
-    neighbour_below[:, 1:] |= water_below[:, :-1]
-    neighbour_below[:, :-1] |= water_below[:, 1:]
-
-    return inside & neighbour_below
-
-def compute_mhd(mask_A, edt_A, mask_B, edt_B):
-    """
-    Modified Hausdorff Distance between two front masks, in grid units.
-
-    edt_X is the Euclidean distance transform of ~mask_X, i.e. the distance from
-    every grid cell to the nearest front point of X. Reading it at the other
-    set's points gives the same nearest-neighbour distances as a full pairwise
-    cdist, but in O(N) instead of O(|A|*|B|).
-    """
-    if not mask_A.any() or not mask_B.any():
-        return np.inf  # Handle empty front edge cases
-
-    return max(edt_B[mask_A].mean(), edt_A[mask_B].mean())
+# Front extraction and MHD are shared with the SWOT -> GLORYS workflow (fronts.py),
+# so both report the same quantity. `grid_spacing_km` hands the distance transform
+# the physical cell size, which converts the result from grid cells to km and
+# corrects the grid's lon/lat anisotropy at the same time.
+FRONT_SAMPLING = grid_spacing_km(ssh_data.longitude.values, ssh_data.latitude.values)
 
 # %%
 sst_clim_mean, sst_clim_std, sst_normalized = normalize_by_climatology(sst_data)
@@ -361,19 +333,21 @@ def anomaly_rmsd(name):
 
 def front_mhd(name="ssh"):
     """
-    MHD between the target's Loop Current front and every library day's.
+    MHD (km) between the target's Loop Current front and every library day's.
 
     Works on the raw field. The front is a property of physical SSH; the
     normalized anomaly has exactly the mean structure that defines it removed.
     """
     library_raw = FIELDS[name]["raw"].sel(time=LIBRARY_DATES).compute()
-    target_mask = front_mask(FIELDS[name]["raw"].sel(time=target_time).values)
-    target_edt = distance_transform_edt(~target_mask)
+    target = front_mask(FIELDS[name]["raw"].sel(time=target_time).values,
+                        level=SSH_CONTOUR_LEVEL)
+    target_edt = front_edt(target, FRONT_SAMPLING)      # one transform for all pairs
 
     scores = np.empty(library_raw.sizes["time"])
     for i, grid in enumerate(library_raw.values):
-        mask = front_mask(grid)
-        scores[i] = compute_mhd(target_mask, target_edt, mask, distance_transform_edt(~mask))
+        # inf, not NaN: a day with no front must never be selected as an analog.
+        scores[i] = front_mhd_km(front_mask(grid, level=SSH_CONTOUR_LEVEL), target,
+                                 FRONT_SAMPLING, edt_b=target_edt, empty=np.inf)
     return xr.DataArray(scores, coords={"time": library_raw.time}, dims="time")
 
 
@@ -382,7 +356,7 @@ SELECTION_METRICS = {
     "ssh_rmsd": lambda: anomaly_rmsd("ssh"),
     "ssh_front_mhd": lambda: front_mhd("ssh"),
 }
-SELECTION_UNITS = {"sst_rmsd": "sigma", "ssh_rmsd": "sigma", "ssh_front_mhd": "grid units"}
+SELECTION_UNITS = {"sst_rmsd": "sigma", "ssh_rmsd": "sigma", "ssh_front_mhd": "km"}
 
 if SELECTION_METRIC not in SELECTION_METRICS:
     raise ValueError(f"unknown selection_metric {SELECTION_METRIC!r}; choose from {sorted(SELECTION_METRICS)}")
@@ -477,13 +451,10 @@ def field_acc(name):
 
 
 def front_mhd_error(forecast, truth, valid_time):
-    """Displacement between the forecast Loop Current front and the observed one."""
-    forecast_mask = front_mask(forecast["ssh"].values)
-    truth_mask = front_mask(truth["ssh"].values)
-    return compute_mhd(
-        forecast_mask, distance_transform_edt(~forecast_mask),
-        truth_mask, distance_transform_edt(~truth_mask),
-    )
+    """Displacement (km) between the forecast Loop Current front and the observed one."""
+    return front_mhd_km(front_mask(forecast["ssh"].values, level=SSH_CONTOUR_LEVEL),
+                        front_mask(truth["ssh"].values, level=SSH_CONTOUR_LEVEL),
+                        FRONT_SAMPLING)
 
 
 SCORE_METRICS = {
@@ -496,7 +467,7 @@ SCORE_METRICS = {
 SCORE_UNITS = {
     "sst_rmse": "°C", "ssh_rmse": "m",
     "sst_acc": "correlation", "ssh_acc": "correlation",
-    "ssh_front_mhd": "grid units",
+    "ssh_front_mhd": "km",
 }
 # ACC is a skill score, so it ranks the opposite way to the error metrics.
 SCORE_HIGHER_IS_BETTER = {"sst_acc", "ssh_acc"}
@@ -698,5 +669,3 @@ for row, (var, field) in enumerate(FIELDS.items()):
 plt.tight_layout()
 plt.savefig(f"{FIG_DIR}/target_vs_best_analog_by_{SELECTION_METRIC}.png", dpi=150)
 plt.show()
-
-# %%
