@@ -90,16 +90,17 @@ analogs:
   #                 for gridded absolute-SSH observations added later.
   distance: correlation
 
+  # Area of the field used to RANK library days. Omit or null for the whole
+  # domain. Independent of forecast.region below, so a run can select on one
+  # area and verify on another.
+  region: null
+
 # Climatology the fields are standardized against, shared with the
 # GLORYS-to-GLORYS run. See config/analog_forecast.yaml for what the knobs do.
 climatology:
   group: climday
   reduce_dims: []
 
-  # Area of the field used to RANK library days. Omit or null for the whole
-  # domain. Independent of forecast.region below, so a run can select on one
-  # area and verify on another.
-  region: null
 forecast:
   # Lead time in days at which the analogs are verified (the headline number).
   lead_days: 14
