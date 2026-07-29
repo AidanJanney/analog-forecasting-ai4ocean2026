@@ -5,11 +5,14 @@
 # Because selection depends ONLY on (obs_grid, mask), each rung is
 # one call with a different selection target:
 #
-#   metric-analog        SWOT swath  + swath mask      the real metric (current)
-#   obs-oracle (mask)    GLORYS@T    + swath mask      perfect obs, same coverage
-#   present-oracle       GLORYS@T    + full ocean      perfect obs, full coverage
-#   present-oracle (ds)  deseas@T    + full ocean      mesoscale-only selection
-#   future-oracle        GLORYS@T+14 + full ocean      best library match to truth (lead 0)
+#   metric-analog        SWOT swath   + swath mask     the real metric (current)
+#   obs-oracle (mask)    anom(GLORYS@T)+ swath mask    perfect obs, same coverage
+#   present-oracle       anom(GLORYS@T)+ full ocean    perfect obs, full coverage
+#   present-oracle (ds)  deseas@T     + full ocean     mesoscale-only selection
+#   future-oracle        deseas@T+14  + full ocean     best library match to truth (lead 0)
+#
+# Every rung enters the distance as a library-referenced ANOMALY, matching `lib.anom`
+# (see obs_gap.py for the paired-CI decomposition of the two gaps this exposes).
 #
 # All are scored against the dense GLORYS truth at T+14 with full-field ACC AND the
 # Loop Current front MHD. Reading: present-oracle >> metric-analog => the metric is
@@ -82,7 +85,12 @@ for T in obs_days_all:
     if mask.sum() < MIN_CELLS:
         continue
     gT, gV = field_on(T), field_on(vday)              # dense GLORYS @T and @T+14
-    gT_ds = lib.deseasonalize(lib.anom_of(gT), T)     # deseasonalized dense @T
+    # The oracle rungs must enter the distance in the SAME space as `lib.anom`.
+    # Correlation centering removes a scalar offset but NOT the spatial mean-surface
+    # pattern, so feeding an absolute field here handicaps the oracles by ~0.10 ACC
+    # (it used to make obs-oracle score *worse* than the real SWOT metric).
+    gT_anom = lib.anom_of(gT)                         # dense @T, library-referenced
+    gT_ds = lib.deseasonalize(gT_anom, T)             # deseasonalized dense @T
     gV_ds = lib.deseasonalize(lib.anom_of(gV), vday)  # deseasonalized dense truth @T+14
 
     # Each rung = same score, different selection target: select → forecast → evaluate.
@@ -92,8 +100,8 @@ for T in obs_days_all:
         return sa.evaluate(lib, selection, ens, gV, vday, persist_surf=gT, lead=L)
 
     runs["metric-analog"].append(rung(selector, obs_grid, mask))
-    runs["obs-oracle (mask)"].append(rung(selector, gT, mask))
-    runs["present-oracle"].append(rung(selector, gT, lib.ocean))
+    runs["obs-oracle (mask)"].append(rung(selector, gT_anom, mask))
+    runs["present-oracle"].append(rung(selector, gT_anom, lib.ocean))
     runs["present-oracle (ds)"].append(rung(selector_ds, gT_ds, lib_ds.ocean))
     runs["future-oracle"].append(          # best library mesoscale match to the truth, lead 0
         rung(selector_ds, gV_ds, lib_ds.ocean, L=0))

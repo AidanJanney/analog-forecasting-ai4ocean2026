@@ -159,38 +159,119 @@ class FrontMHDDistance(ObsDistance):
 
 
 class LatentDistance(ObsDistance):
-    """Distance in a learned latent-encoded space  ── STUB (not implemented).
+    """Distance in a learned, forecast-relevant latent space (see :mod:`latent`).
 
-    Intended design (gated by the oracle diagnostic — see oracle.py /
-    metric_diagnostic.py, which measure whether a better *current-field* selection
-    metric has headroom before this is worth building):
-
-        z_i    = encoder(library.surf[i])          # per-state latent vector
-        z_obs  = encoder(fill(obs_grid, mask))      # masked obs → latent
+        z_i      = encoder(library.anom[i], full ocean)   # per-state latent vector
+        z_obs    = encoder(obs_grid, mask)                # masked obs → latent
         distance = 1 − cos(z_obs, z_i)
 
-    The encoder is trained so that the latent distance on the *current* field
-    predicts *future* state similarity (the present-oracle ceiling): minimise
-    ``| d_latent(t0, a) − (1 − S_future(t0, a)) |`` over library pairs. Only the
-    surface/observable field is encoded — depth stays in the forecast target.
+    The encoder is trained so that latent distance on the *current* field predicts
+    *future* state similarity — minimising ``|d_latent(t0, a) − (1 − S_future(t0, a))|``
+    over library pairs — which is the one gap ``obs_gap.py`` finds both significant
+    and reachable (D − C = +0.055 ACC). Because it is trained with random swath
+    masks and takes the mask as an input channel, a partial SWOT view embeds near the
+    full-field embedding of the same state; library states are encoded once at full
+    coverage in :meth:`prepare`.
+
+    Pass either a trained ``encoder`` (+ ``scale``) or ``path`` to weights written by
+    ``latent.save`` (see ``train_latent.py``). Selection stays surface/observable:
+    only ``library.anom`` is encoded.
     """
 
     name = "latent"
 
-    def __init__(self, encoder=None, **kwargs):
+    def __init__(self, encoder=None, path=None, scale=None):
+        if encoder is None and path is None:
+            raise ValueError(
+                "LatentDistance needs a trained encoder: pass encoder=/scale= or "
+                "path= to weights from latent.save (train one with train_latent.py).")
         self.encoder = encoder
-        self._kwargs = kwargs
+        self.path = path
+        self.scale = scale
+        self.meta = None
+        self._Z = None
+
+    @property
+    def latents(self):
+        """The (n, latent_dim) library embeddings (available after prepare)."""
+        return self._Z
+
+    def signature(self):
+        lead = (self.meta or {}).get("lead", "?")
+        return f"{self.name}_L{lead}"
 
     def prepare(self, library, source=None, use_cache=True):
-        raise NotImplementedError(
-            "LatentDistance is a documented stub. Implement an encoder that maps "
-            "the surface field to a latent vector and train it so current-field "
-            "latent distance predicts future similarity (see oracle.py for the "
-            "headroom gate that justifies building it). Until then, use "
-            "CorrelationDistance.")
+        import latent as lat
+
+        self.library = library
+        if self.encoder is None:
+            self.encoder, self.meta = lat.load(self.path)
+            self.scale = self.meta["scale"]
+        self._Z = lat.encode_all(self.encoder, library.anom, library.ocean, self.scale)
+        self._Zn = self._Z / (np.linalg.norm(self._Z, axis=1, keepdims=True) + 1e-8)
+        return self
 
     def distance(self, obs_grid, mask, self_index=None):
-        raise NotImplementedError("LatentDistance is a documented stub; see prepare().")
+        import latent as lat
+
+        # Self-source: the observation IS a library state, so encode the library's
+        # own anomaly (matching the space the encoder was trained on). A cross-source
+        # observation is already anomaly-like and is encoded as given.
+        field = self.library.anom[self_index] if self_index is not None else obs_grid
+        x = lat.encoder_inputs(field, mask & self.library.ocean, self.scale)
+        z = np.asarray(self.encoder(x))
+        z = z / (np.linalg.norm(z) + 1e-8)
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            return 1.0 - self._Zn @ z     # float32 BLAS may warn spuriously
+
+
+class LearnedWeightDistance(ObsDistance):
+    """``1 − corr_w`` under a *learned* spatial weight map (see :mod:`latent`).
+
+    Identical to :class:`CorrelationDistance` except that the latitude weights are
+    replaced by a map fitted so the current-field distance predicts *future*
+    similarity (the D − C gap in ``obs_gap.py``). Because the map is initialised at
+    ``cos(lat)``, this class starts exactly at the ``CorrelationDistance`` baseline
+    and departs from it only where the training data pays for it — unlike a learned
+    latent embedding, which must first re-learn the correlation it is replacing.
+
+    Pass ``weights`` (an (nlat, nlon) array) or ``path`` to a ``.npz`` written by
+    ``train_weights.py``. Offset/scale invariance is unchanged, so raw SWOT ``ssha``
+    may be passed as-is.
+    """
+
+    name = "learned-w"
+
+    def __init__(self, weights=None, path=None):
+        if weights is None and path is None:
+            raise ValueError("LearnedWeightDistance needs weights= or path= "
+                             "(train one with train_weights.py).")
+        self.path = path
+        self.w2d = weights
+        self.meta = None
+
+    def signature(self):
+        lead = (self.meta or {}).get("lead", "?")
+        return f"{self.name}_L{lead}"
+
+    def prepare(self, library, source=None, use_cache=True):
+        if self.w2d is None:
+            z = np.load(self.path)
+            self.w2d = z["w2d"]
+            self.meta = {k: z[k] for k in z.files if k != "w2d"}
+        self.library = library
+        self.anom = library.anom
+        self.ocean = library.ocean
+        assert self.w2d.shape == self.ocean.shape, "weight map != library grid"
+        return self
+
+    def distance(self, obs_grid, mask, self_index=None):
+        field = self.anom[self_index] if self_index is not None else obs_grid
+        valid = mask & np.isfinite(field) & self.ocean
+        o = field[valid].astype(np.float32)
+        X = self.anom[:, valid]
+        w = self.w2d[valid].astype(np.float32)
+        return 1.0 - _weighted_corr(o, X, w)
 
 
 def _as_da(grid, lon, lat):

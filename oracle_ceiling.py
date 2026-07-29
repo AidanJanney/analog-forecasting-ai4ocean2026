@@ -15,8 +15,9 @@ from oracle import ceiling_curves
 
 # %% ---- CONFIG ----------------------------------------------------------- #
 DATA_CANDIDATES = [
-    "data/glorys_gom_zos_2004_2013.nc",
-    "data/glorys_gom_zos_2004.nc",
+    # "data/glorys_gom_zos_2004_2013.nc",
+    # "data/glorys_gom_zos_2004.nc",
+    "data/glorys_gom_zos_thetao_all.nc"
 ]
 K, EXCLUDE = 10, 30                         # analogs kept; temporal exclusion (days)
 LEADS = list(range(1, 16))
